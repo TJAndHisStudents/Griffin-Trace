@@ -14,6 +14,8 @@ Griffin is a general operating system mechanism for Control-Flow Integrity (CFI)
 1. Logging
 	1. Generating a Trace
 	1. Reviewing the Trace
+1. Example Workflows
+	1. From Installation to Reviewing a Program Trace
 
 
 ## How It Works
@@ -154,3 +156,56 @@ Then you can use the tool to produce a legible trace:
 ```$ /path/to/griffin/tools/pt/pt /path/to/pt.log```
 
 This will produce a fairly large trace depending on the program, so you may want to feed the output into another file.
+
+
+## Example Workflows
+
+Provided here are a few complete example workflows for common use cases in Griffin:
+
+### From Installation to Reviewing a Program Trace
+
+Keep in mind that the Griffin kernel is built for Linux 4.2, so this kernel will only safely build and install on 4.2.
+
+1. Download Linux Kernel with Griffin
+
+	The following will clone this kernel repository to your home directory under the folder "griffin-kernel".
+
+	```$ git clone https://github.com/TJAndHisStudents/Griffin.git ~/griffin-kernel```
+
+1. Install Griffin
+
+	Change your directory to ~/griffin-kernel and install the kernel:
+
+	```$ cd ~/griffin-kernel```
+
+	```$ cp config .config```
+
+	```$ make -j8```
+
+	```$ sudo make modules_install install```
+
+1. Make the PT trace analysis tool
+
+	```$ cd ~/griffin-kernel/tools/pt/```
+	
+	```$ make```
+
+1. Run a program and collect the trace
+
+	For this example, we're going to analyze the ```ls``` program in your home directory:
+
+	```$ cd ~```
+
+	```$ echo -n ls > /sys/kernel/debug/pt_monitor```
+	
+	```$ ls ./```
+	
+	```$ cp /var/log/pt.log ~/pt.log```
+	
+	```$ echo -e "\x00" | tee /sys/kernel/debug/pt_monitor```
+
+1. Analyze the trace
+
+	Finally, we'll run the trace through the analysis program and save the output to ```pt-ls-trace.log```
+
+	```$ ~/griffin-kernel/tools/pt/ ~/pt.log > pt-ls-trace.log```
