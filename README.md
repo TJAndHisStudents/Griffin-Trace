@@ -208,4 +208,4 @@ Keep in mind that the Griffin kernel is built for Linux 4.2, so this kernel will
 
 	Finally, we'll run the trace through the analysis program and save the output to ```pt-ls-trace.log```
 
-	```$ ~/griffin-kernel/tools/pt/ ~/pt.log > pt-ls-trace.log```
+	```$ ~/griffin-kernel/tools/pt/pt ~/pt.log > pt-ls-trace.log```
