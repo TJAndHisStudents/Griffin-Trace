@@ -22,7 +22,7 @@
  *   - bool pt_block_is_ret(block)
  *   - bool pt_block_is_cond(block)
  *   - bool pt_block_is_syscall(block)
- *   - pt_block *pt_get_block(addr)
+ *   - pt_block *pt_get_block(addr, pt_recover_arg)
  *   - bool pt_in_block(addr, block)
  *   - unsigned long pt_get_fallthrough_addr(block)
  *   - pt_block *pt_get_fallthrough_block(block)
@@ -48,7 +48,6 @@
  * (Feel free to replace it as needed :P)
  *
  * It provides callbacks while recovering control flows:
- *   - void pt_on_block(addr, arg)
  *   - void pt_on_call(addr, arg)
  *   - void pt_on_ret(addr, arg)
  *   - void pt_on_xabort(arg)
@@ -57,8 +56,8 @@
  *   - void pt_on_mode(payload, arg)
  */
 
-#ifndef _PT_H
-#define _PT_H
+#ifndef _PT_BLAME_H
+#define _PT_BLAME_H
 
 #ifdef PT_USE_MIRROR
 
@@ -88,7 +87,7 @@ typedef struct _pt_block {
 #include <stdlib.h>
 #include <string.h>
 
-static inline pt_block *pt_disasm_block(unsigned long addr)
+static inline pt_block *pt_disasm_block(unsigned long addr, pt_recover_arg arg)
 {
 	unsigned int n, dist;
 	pt_block *block;
@@ -111,16 +110,24 @@ retry:
 	case FC_CALL:
 		block->kind = inst.ops[0].type == O_PC? PT_BLOCK_DIRECT_CALL: PT_BLOCK_INDIRECT_CALL;
 		block->fallthrough_addr = inst.addr + inst.size;
-		if (block->kind == PT_BLOCK_DIRECT_CALL)
+		if (block->kind == PT_BLOCK_DIRECT_CALL) {
 			block->target_addr = block->fallthrough_addr + inst.imm.sdword;
+			pt_on_direct_call(block->target_addr);
+			pt_plt_addr(block->target_addr, addr, arg);
+		} else {
+			pt_on_indirect_call(block->fallthrough_addr);
+			pt_plt_addr(block->fallthrough_addr, addr, arg);
+		}
 		break;
 	case FC_RET:
 		block->kind = PT_BLOCK_RET;
 		block->fallthrough_addr = inst.addr + inst.size;
+		//pt_on_return(block->fallthrough_addr);
 		break;
 	case FC_SYS:
 		block->kind = PT_BLOCK_SYSCALL;
 		block->fallthrough_addr = inst.addr + inst.size;
+		pt_on_syscall(block->fallthrough_addr);
 		break;
 	case FC_UNC_BRANCH:
 		block->kind = inst.ops[0].type == O_PC? PT_BLOCK_DIRECT_JMP: PT_BLOCK_INDIRECT_JMP;
@@ -150,37 +157,37 @@ retry:
 	return block;
 }
 
-static inline pt_block *pt_get_block(unsigned long addr)
+static inline pt_block *pt_get_block(unsigned long addr, pt_recover_arg arg)
 {
 	pt_block *block = *(pt_block **) PT_IP_TO_BLOCK(addr);
 
 	if (!block) {
-		block = pt_disasm_block(addr);
+		block = pt_disasm_block(addr, arg);
 		*(pt_block **) PT_IP_TO_BLOCK(addr) = block;
 	}
 
 	return block;
 }
 
-#define pt_in_block(a, b) (pt_get_block(a)->fallthrough_addr == (b)->fallthrough_addr)
+#define pt_in_block(a, b, arg) (pt_get_block(a, arg)->fallthrough_addr == (b)->fallthrough_addr)
 
 #define pt_get_fallthrough_addr(b) (b)->fallthrough_addr
 
 static inline pt_block *
-pt_get_fallthrough_block(pt_block *block)
+pt_get_fallthrough_block(pt_block *block, pt_recover_arg arg)
 {
 	if (!block->fallthrough_block)
-		block->fallthrough_block = pt_get_block(pt_get_fallthrough_addr(block));
+		block->fallthrough_block = pt_get_block(pt_get_fallthrough_addr(block), arg);
 	return block->fallthrough_block;
 }
 
 #define pt_get_target_addr(b) (b)->target_addr
 
 static inline pt_block *
-pt_get_target_block(pt_block *block)
+pt_get_target_block(pt_block *block, pt_recover_arg arg)
 {
 	if (!block->target_block)
-		block->target_block = pt_get_block(pt_get_target_addr(block));
+		block->target_block = pt_get_block(pt_get_target_addr(block), arg);
 	return block->target_block;
 }
 
@@ -266,7 +273,6 @@ pt_get_packet(unsigned char *buffer, unsigned long size, unsigned long *len)
 							if (second_byte != 0x82)
 								return PT_PACKET_ERROR;
 							kind = PT_PACKET_PSB;
-							printf("  PSB packet found\n");
 							*len = 16;
 						}
 					} else { // ???????1
@@ -392,6 +398,8 @@ pt_get_packet(unsigned char *buffer, unsigned long size, unsigned long *len)
 		}
 	}
 
+	//printf(" kind: %d\n", kind);
+
 	return kind;
 }
 
@@ -467,12 +475,12 @@ do { \
 do { \
 	while (pt_block_is_direct(curr_block) && (!(cond))) { \
 		if (pt_block_is_call(curr_block)) { \
-			pt_on_call(pt_get_fallthrough_addr(curr_block), arg); \
+			pt_on_call(pt_get_fallthrough_addr(curr_block), arg, packet); \
 			retc[retc_index] = curr_block; \
 			retc_index = (retc_index + 1) % RETC_STACK_SIZE; \
 		} \
 		pt_on_block(pt_get_target_addr(curr_block), arg); \
-		curr_block = pt_get_target_block(curr_block); \
+		curr_block = pt_get_target_block(curr_block, arg); \
 	} \
 } while(0)
 
@@ -483,6 +491,8 @@ do { \
 
 	while (bytes_remained > 0) {
 		kind = pt_get_packet(packet, bytes_remained, &packet_len);
+
+		// Reconstruction gets this far...
 
 		switch (kind) {
 		case PT_PACKET_TNTSHORT:
@@ -495,14 +505,15 @@ do { \
 						retc_index = (retc_index + RETC_STACK_SIZE - 1) % RETC_STACK_SIZE;
 						pt_on_ret(pt_get_fallthrough_addr(retc[retc_index]), arg);
 						pt_on_block(pt_get_fallthrough_addr(retc[retc_index]), arg);
-						curr_block = pt_get_fallthrough_block(retc[retc_index]);
+						pt_on_return(pt_get_fallthrough_addr(retc[retc_index]));
+						curr_block = pt_get_fallthrough_block(retc[retc_index], arg);
 					} else {
 						pt_on_block(pt_get_target_addr(curr_block), arg);
-						curr_block = pt_get_target_block(curr_block);
+						curr_block = pt_get_target_block(curr_block, arg);
 					}
 				} else {
 					pt_on_block(pt_get_fallthrough_addr(curr_block), arg);
-					curr_block = pt_get_fallthrough_block(curr_block);
+					curr_block = pt_get_fallthrough_block(curr_block, arg);
 				}
 			} while (bit_selector != 2);
 			break;
@@ -514,21 +525,22 @@ do { \
 				FOLLOW_DIRECT();
 
 				if (pt_block_is_call(curr_block)) {
-					pt_on_call(pt_get_fallthrough_addr(curr_block), arg);
+					pt_on_call(pt_get_fallthrough_addr(curr_block), arg, packet);
 					retc[retc_index] = curr_block;
 					retc_index = (retc_index + 1) % RETC_STACK_SIZE;
 				} else if (pt_block_is_ret(curr_block)) {
 					pt_on_ret(curr_addr, arg);
+					pt_on_return(curr_addr);
 				}
 			}
 
 			pt_on_block(curr_addr, arg);
-			curr_block = pt_get_block(curr_addr);
+			curr_block = pt_get_block(curr_addr, arg);
 			break;
 
 		case PT_PACKET_TIPPGE:
 			curr_addr = pt_get_and_update_ip(packet, packet_len, &last_ip);
-			curr_block = pt_get_block(curr_addr);
+			curr_block = pt_get_block(curr_addr, arg);
 			pt_on_block(curr_addr, arg);
 			break;
 
@@ -540,7 +552,7 @@ do { \
 
 		case PT_PACKET_FUP:
 			curr_addr = pt_get_and_update_ip(packet, packet_len, &last_ip);
-			FOLLOW_DIRECT_UNTIL(pt_in_block(curr_addr, curr_block));
+			FOLLOW_DIRECT_UNTIL(pt_in_block(curr_addr, curr_block, arg));
 			curr_block = NULL;
 			break;
 
@@ -564,11 +576,11 @@ do { \
 					NEXT_PACKET();
 				} while (kind != PT_PACKET_FUP);
 				curr_addr = pt_get_and_update_ip(packet, packet_len, &last_ip);
-				FOLLOW_DIRECT_UNTIL(pt_in_block(curr_addr, curr_block));
+				FOLLOW_DIRECT_UNTIL(pt_in_block(curr_addr, curr_block, arg));
 
 				switch ((mode_payload & (unsigned char)0x3)) {
 				case 0:
-					pt_on_xcommit(arg);
+					pt_on_xcommit(arg, packet);
 					break;
 				case 1:
 					pt_on_xbegin(arg);
@@ -591,12 +603,14 @@ do { \
 				NEXT_PACKET();
 			} while (kind != PT_PACKET_FUP);
 			curr_addr = pt_get_and_update_ip(packet, packet_len, &last_ip);
-			curr_block = pt_get_block(curr_addr);
+			curr_block = pt_get_block(curr_addr, arg);
 			break;
 
 		default:
 			break;
 		}
+
+		printf("  packet length: %lu\n", packet_len);
 
 		bytes_remained -= packet_len;
 		packet += packet_len;

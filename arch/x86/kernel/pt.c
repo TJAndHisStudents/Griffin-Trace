@@ -186,25 +186,6 @@ static struct file *pt_logfile = NULL;
 static loff_t pt_logfile_off = 0;
 static DEFINE_MUTEX(pt_logfile_mtx);
 
-#if 0
-static int num_allocations = 0;
-static DEFINE_MUTEX(pt_memory_mgmt_mtx);
-
-#define pt_memory_ctr_incr() do { \
-	mutex_lock(&pt_memory_mgmt_mtx); \
-	num_allocations++; \
-	pt_print("tracing memory counter alloc: %d\n", num_allocations); \
-	mutex_unlock(&pt_memory_mgmt_mtx); \
-} while (0)
-
-#define pt_memory_ctr_decr() do { \
-	mutex_lock(&pt_memory_mgmt_mtx); \
-	num_allocations--; \
-	pt_print("tracing memory counter dealloc: %d\n", num_allocations); \
-	mutex_unlock(&pt_memory_mgmt_mtx); \
-} while (0)
-#endif
-
 #define pt_close_logfile() do { \
 	if (pt_logfile) { \
 		filp_close(pt_logfile, NULL); \
@@ -220,6 +201,158 @@ static DEFINE_MUTEX(pt_memory_mgmt_mtx);
 	UNHANDLED(s < 0); \
 	pt_logfile_off += s; \
 } while (0)
+
+
+/** Ring Buffer storage of packets **/
+
+// Need a circular linked list (a ring buffer) to manage all of the last N packets
+//#define RING_BUFFER_COUNT 100
+#define RING_BUFFER_COUNT 6
+
+// The data storage needs to be able to accommodate the largest amount of data possible
+#define RING_ITEM_DATA_SIZE TOPA_BUFFER_SIZE + PAGE_SIZE
+
+static struct kmem_cache *pt_ring_buffer_cache    = NULL;
+static struct kmem_cache *pt_ring_item_cache      = NULL;
+static struct kmem_cache *pt_ring_item_data_cache = NULL;
+
+struct pt_ring_item {
+	int index;
+	ssize_t data_length;
+	char * data;
+	struct pt_ring_item * next;
+	struct pt_ring_item * prev;
+};
+
+struct pt_ring_buffer {
+	struct pt_ring_item * curr;
+	struct pt_ring_item * head;
+	void (* add_ring_item)(void *, ssize_t);
+	void (* print_buffer)(void);
+};
+
+static struct pt_ring_buffer * ring_buffer;
+
+void add_ring_item(void * data, ssize_t data_length) {
+	pt_print("Adding buffer for #%d, size (%zd)\n", ring_buffer->curr->index, data_length);
+
+	// If we haven't allocated the next ring buffer, then do so now
+	if (unlikely(ring_buffer->curr->next == NULL)) {
+		// If we're at the end of the ring, loop around
+		if ((ring_buffer->curr->index + 1) % RING_BUFFER_COUNT == 0) {
+			// Return to the beginning
+			ring_buffer->curr->next = ring_buffer->head;
+		} else {
+			// Construct the next ring item
+			ring_buffer->curr->next = kmem_cache_alloc(pt_ring_item_cache, GFP_KERNEL);
+			memset(ring_buffer->curr->next, 0, sizeof(struct pt_ring_item));
+			ring_buffer->curr->next->index = ring_buffer->curr->index + 1;
+			ring_buffer->curr->next->data_length = 0; // Potentially redundant
+		}
+
+		// Allocate the current data
+		ring_buffer->curr->data = kmem_cache_alloc(pt_ring_item_data_cache, GFP_KERNEL);
+
+		// Set the next ring item's previous pointer to the current ring item
+		ring_buffer->curr->next->prev = ring_buffer->curr;
+	}
+
+	// Verify that the data length does not exceed the cache block
+	// For the short term, let's cap the data size to the ring item data size
+	if (data_length > RING_ITEM_DATA_SIZE) {
+		data_length = RING_ITEM_DATA_SIZE;
+	}
+
+	// Set the current data & length
+	memcpy(ring_buffer->curr->data, data, data_length);
+	ring_buffer->curr->data_length = data_length;
+
+	// Now set the new current ring item
+	ring_buffer->curr = ring_buffer->curr->next;
+}
+
+void print_buffer(void) {
+	unsigned int first_index;
+
+	// Validate that we have a buffer to print
+	if (ring_buffer == NULL || ring_buffer->curr == NULL) {
+		return;
+	}
+
+	pt_print("Current buffer is #%d, size (%zd)\n", ring_buffer->curr->index, ring_buffer->curr->data_length);
+
+	// If we don't have a full ring buffer, start at the head
+	if (ring_buffer->curr->next == NULL) {
+		ring_buffer->curr = ring_buffer->head;
+	}
+
+	// Set the first index for a stopping criterion
+	first_index = ring_buffer->curr->index;
+
+	// Validate the starting criterion - that we have data to print
+	if (ring_buffer->curr->data_length <= 0) {
+		return;
+	}
+
+	// Print all of the buffers
+	// Use do-while because we want to stop at the same index as the one we started with
+	do {
+		pt_print("Printing buffer #%d to %d, size (%zd)\n", ring_buffer->curr->index, first_index, ring_buffer->curr->data_length);
+		pt_log(ring_buffer->curr->data, ring_buffer->curr->data_length);
+		ring_buffer->curr = ring_buffer->curr->next;
+	} while (
+		ring_buffer->curr != NULL && 
+		ring_buffer->curr->data_length > 0 &&
+		ring_buffer->curr->index != first_index
+	);
+}
+
+int initialize_ring_buffer(void) {
+	// Devote space to the ring buffer, the items in the ring, and the data linked by the items
+	pt_ring_buffer_cache = kmem_cache_create("pt_ring_buffer_cache", sizeof(struct pt_ring_buffer), 0, 0, NULL);
+	if (!pt_ring_buffer_cache)
+		goto destroy_ring_buffer_cache;
+
+	pt_ring_item_cache = kmem_cache_create("pt_ring_item_cache", sizeof(struct pt_ring_item), 0, 0, NULL);
+	if (!pt_ring_item_cache)
+		goto destroy_ring_item_cache;
+
+	pt_ring_item_data_cache = kmem_cache_create("pt_ring_item_data_cache", RING_ITEM_DATA_SIZE, 0, 0, NULL);
+	if (!pt_ring_item_data_cache)
+		goto destroy_ring_item_data_cache;
+
+	// Initialize the ring buffer
+	ring_buffer = kmem_cache_alloc(pt_ring_buffer_cache, GFP_KERNEL);
+	memset(ring_buffer, 0, sizeof(struct pt_ring_buffer));
+
+	// Now set the functions
+	if (ring_buffer != NULL) {
+		ring_buffer->add_ring_item = &add_ring_item;
+		ring_buffer->print_buffer = &print_buffer;
+	}
+
+	// Construct the first ring item
+	ring_buffer->head = kmem_cache_alloc(pt_ring_item_cache, GFP_KERNEL);
+	ring_buffer->head->index = 0;
+	ring_buffer->head->next = NULL;
+	ring_buffer->head->prev = NULL;
+
+	// And set the current ring item to it
+	ring_buffer->curr = ring_buffer->head;
+
+	return 0;
+
+destroy_ring_item_data_cache:
+	kmem_cache_destroy(pt_ring_item_data_cache);
+destroy_ring_item_cache:
+	kmem_cache_destroy(pt_ring_item_cache);
+destroy_ring_buffer_cache:
+	kmem_cache_destroy(pt_ring_buffer_cache);
+	return -1;
+}
+
+/** End Ring Buffer logic **/
+
 
 #pragma pack(push)
 
@@ -238,7 +371,11 @@ static void pt_log_header(void)
 	};
 
 	mutex_lock(&pt_logfile_mtx);
+	
+	// We need to include the header in the PT file no matter what
 	pt_log(&h, sizeof(h));
+	//ring_buffer->add_ring_item(&h, sizeof(h));
+
 	mutex_unlock(&pt_logfile_mtx);
 }
 
@@ -281,8 +418,10 @@ static void pt_log_buffer(struct pt_buffer *buf)
 	};
 
 	mutex_lock(&pt_logfile_mtx);
-	pt_log(&item, sizeof(item));
-	pt_log(buf->raw, buf->size);
+	//pt_log(&item, sizeof(item));
+	ring_buffer->add_ring_item(&item, sizeof(item));
+	//pt_log(buf->raw, buf->size);
+	ring_buffer->add_ring_item(buf->raw, buf->size);
 	mutex_unlock(&pt_logfile_mtx);
 }
 
@@ -311,6 +450,7 @@ static void pt_log_thread(struct task_struct *task)
 
 	mutex_lock(&pt_logfile_mtx);
 	pt_log(&item, sizeof(item));
+	//ring_buffer->add_ring_item(&item, sizeof(item));
 	mutex_unlock(&pt_logfile_mtx);
 }
 
@@ -328,7 +468,9 @@ static void pt_log_process(struct task_struct *task)
 
 	mutex_lock(&pt_logfile_mtx);
 	pt_log(&item, sizeof(item));
+	//ring_buffer->add_ring_item(&item, sizeof(item));
 	pt_log(pt_monitor, item.cmd_size);
+	//ring_buffer->add_ring_item(pt_monitor, item.cmd_size);
 	mutex_unlock(&pt_logfile_mtx);
 
 	pt_log_thread(task);
@@ -380,17 +522,21 @@ static void pt_log_xpage(struct task_struct *task, u64 base,
 	mutex_lock(&pt_logfile_mtx);
 
 	pt_log(&item, sizeof(item));
+	//ring_buffer->add_ring_item(&item, sizeof(item));
 
 	for (i = 0; i < nr_real_pages; i++) {
 		ret = access_process_vm(task, base + i * PAGE_SIZE,
 				page, PAGE_SIZE, 0);
 		UNHANDLED(ret != PAGE_SIZE);
 		pt_log(page, PAGE_SIZE);
+		//ring_buffer->add_ring_item(page, PAGE_SIZE);
 	}
 
 	memset(page, 0, PAGE_SIZE);
-	for (i = 0; i < nr_pages - nr_real_pages; i++)
+	for (i = 0; i < nr_pages - nr_real_pages; i++) {
 		pt_log(page, PAGE_SIZE);
+		//ring_buffer->add_ring_item(page, PAGE_SIZE);
+	}
 
 	mutex_unlock(&pt_logfile_mtx);
 
@@ -427,6 +573,7 @@ static void pt_log_fork(struct task_struct *parent,
 
 	mutex_lock(&pt_logfile_mtx);
 	pt_log(&item, item.header.size);
+	//ring_buffer->add_ring_item(&item, item.header.size);
 	mutex_unlock(&pt_logfile_mtx);
 }
 
@@ -874,9 +1021,6 @@ static struct pt_block *pt_disasm_block(u64 addr)
 	};
 
 	block = kmem_cache_alloc(pt_block_cache, GFP_KERNEL);
-#if 0
-	pt_memory_ctr_incr();
-#endif
 	memset(block, 0, sizeof(struct pt_block));
 retry:
 	r = distorm_decompose(&codeInfo, &inst, 1, &n);
@@ -939,9 +1083,6 @@ static inline struct pt_block *pt_get_block(unsigned long addr)
 		new_block = atomic64_cmpxchg(mirror_addr, 0, (long) block);
 		if (new_block) {
 			kmem_cache_free(pt_block_cache, block);
-#if 0
-			pt_memory_ctr_decr();
-#endif
 			block = (struct pt_block *) new_block;
 		}
 	}
@@ -1071,13 +1212,7 @@ static void pt_work(struct work_struct *work)
 	if (buf->notifier)
 		complete(buf->notifier);
 	kmem_cache_free(pt_trace_cache, buf->raw);
-#if 0
-	pt_memory_ctr_decr();
-#endif
 	kmem_cache_free(pt_buffer_cache, buf);
-#if 0
-	pt_memory_ctr_decr();
-#endif
 }
 
 static void pt_tasklet(unsigned long data)
@@ -1096,9 +1231,6 @@ static int pt_move_trace_to_work(struct topa *topa, u32 size,
 	buf = kmem_cache_alloc(pt_buffer_cache, GFP_ATOMIC);
 	if (!buf)
 		goto fail;
-#if 0
-	pt_memory_ctr_incr();
-#endif
 
 	INIT_WORK(&buf->work, pt_work);
 	tasklet_init(&buf->tasklet, pt_tasklet, (unsigned long) buf);
@@ -1139,9 +1271,6 @@ static void pt_flush_trace(struct topa *child_topa, bool waiting)
 	new_buffer = (void *) kmem_cache_alloc(pt_trace_cache, GFP_ATOMIC);
 	if (!new_buffer)
 		goto failed;
-#if 0
-	pt_memory_ctr_incr();
-#endif
 
 	if (pt_move_trace_to_work(topa, size, child_topa, waiting) < 0)
 		goto free_new_buffer;
@@ -1155,9 +1284,6 @@ end:
 
 free_new_buffer:
 	kmem_cache_free(pt_trace_cache, new_buffer);
-#if 0
-	pt_memory_ctr_decr();
-#endif
 failed:
 	UNHANDLED(child_topa || waiting);
 	pt_fail_topa(topa, "out of memory");
@@ -1176,9 +1302,6 @@ static struct topa *pt_alloc_topa(struct task_struct *task)
 	raw = (void *) kmem_cache_alloc(pt_trace_cache, GFP_KERNEL);
 	if (!raw)
 		goto free_topa;
-#if 0
-	pt_memory_ctr_incr();
-#endif
 
 	pt_setup_topa(topa, raw, task);
 
@@ -1328,6 +1451,11 @@ void pt_on_exit(void)
 	pt_debug("[cpu:%d,pid:%d] exit: %s\n", smp_processor_id(),
 			current->pid, pt_monitor);
 	pt_detach();
+
+	// Exiting the program - dump the rest of the trace
+	// Do this AFTER we detach, because the pt_detach function will wait
+	// for the rest of the buffers to be written to disk before we print.
+	ring_buffer->print_buffer();
 }
 
 int pt_on_interrupt(struct pt_regs *regs)
@@ -1433,12 +1561,15 @@ void pt_on_syscall(struct pt_regs *regs)
 	}
 
 	pt_pause();
+	pt_print("Found syscall. Going to flush trace first.");
 	pt_flush_trace(NULL, true);
+	//ring_buffer->print_buffer();
 	pt_resume();
 }
 
 static int __init pt_init(void)
 {
+	int pt_ring_buffer_success;
 	int ret = -ENOMEM;
 
 	if (!pt_avail())
@@ -1461,6 +1592,11 @@ static int __init pt_init(void)
 			TOPA_BUFFER_SIZE + PAGE_SIZE, TOPA_BUFFER_SIZE,
 			0, NULL);
 	if (!pt_trace_cache)
+		goto destroy_block_cache;
+
+	/* Now allocate memory for the PT ring buffer */
+	pt_ring_buffer_success = initialize_ring_buffer();
+	if (pt_ring_buffer_success < 0)
 		goto destroy_block_cache;
 
 	/* setup the workqueue for async computation */
@@ -1498,6 +1634,9 @@ static void __exit pt_exit(void)
 	pt_close_logfile();
 	pt_monitor_destroy();
 	pt_wq_destroy();
+	kmem_cache_destroy(pt_ring_item_data_cache);
+	kmem_cache_destroy(pt_ring_item_cache);
+	kmem_cache_destroy(pt_ring_buffer_cache);
 	kmem_cache_destroy(pt_trace_cache);
 	kmem_cache_destroy(pt_block_cache);
 	kmem_cache_destroy(pt_buffer_cache);
