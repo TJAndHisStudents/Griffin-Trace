@@ -389,10 +389,14 @@ static bool pt_range_open[10]           = {false,false,false,false,false,false,f
 	} \
 } while (0)
 
+// Keep track of when we need to dump a trace due to a syscall
+static bool pt_trace_syscall_trigger = false;
+
 // For dumping traces on system calls
 #define pt_trace_on_syscall() do { \
 	if (_PT_TRACE_SYSCALL) { \
-		pt_print("  Tracing system call\n"); \
+		pt_trace_syscall_trigger = true; \
+		pt_print("  System call captured. Will print at end of packet.\n"); \
 	} \
 } while (0)
 
@@ -1232,6 +1236,13 @@ static void pt_work(struct work_struct *work)
 		complete(buf->notifier);
 	kmem_cache_free(pt_trace_cache, buf->raw);
 	kmem_cache_free(pt_buffer_cache, buf);
+
+	// Once we've logged the buffer, determine if we need to dump the trace
+	if (pt_trace_syscall_trigger) {
+		pt_print("  Dumping trace from syscall trigger.");
+		pt_trace_syscall_trigger = false;
+		ring_buffer->print_buffer();
+	}
 }
 
 static void pt_tasklet(unsigned long data)
@@ -1580,8 +1591,9 @@ void pt_on_syscall(struct pt_regs *regs)
 	}
 
 	pt_pause();
-	pt_flush_trace(NULL, true);
 	pt_trace_on_syscall();
+	pt_flush_trace(NULL, true);
+//	pt_trace_on_syscall();
 	pt_resume();
 }
 
