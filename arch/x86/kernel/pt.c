@@ -109,8 +109,6 @@ struct pt_block {
 };
 
 typedef long pt_event;
-#define PT_EVENT_IS_CALL(e) ((e) > 0)
-#define PT_EVENT_IS_RET(e) ((e) < 0)
 
 struct topa_entry {
 	u64 end:1;
@@ -352,6 +350,137 @@ destroy_ring_buffer_cache:
 }
 
 /** End Ring Buffer logic **/
+
+
+/** API Methods **/
+
+// Flags
+static struct dentry *pt_trace_address_dentry;
+static struct dentry *pt_trace_syscall_dentry;
+
+// Turn on / off the various ways to print traces
+static bool _PT_TRACE_ADDR_RANGE = false;
+static bool _PT_TRACE_SYSCALL    = false;
+
+// For dumping traces within address ranges
+// If these are ordered, we can search through them quickly
+static int pt_range_address_count       = 1;
+static u64 pt_range_start_addresses[10] = {0x400c18,0,0,0,0,0,0,0,0,0};
+static u64 pt_range_end_addresses[10]   = {0x400960,0,0,0,0,0,0,0,0,0};
+static bool pt_range_open[10]           = {false,false,false,false,false,false,false,false,false,false};
+
+// Currently O(num addrs) timing - would like to reduce since this is called a LOT
+#define pt_trace_on_addr_range(last_addr, curr_addr) do { \
+	if (_PT_TRACE_ADDR_RANGE) { \
+		int pt_range_idx = 0; \
+		for (pt_range_idx = 0; pt_range_idx < pt_range_address_count; pt_range_idx++) { \
+			u64 pt_range_start_addr = pt_range_start_addresses[pt_range_idx]; \
+			u64 pt_range_end_addr   = pt_range_end_addresses[pt_range_idx]; \
+			if (!pt_range_open[pt_range_idx] && curr_addr <= pt_range_start_addr) { \
+				pt_range_open[pt_range_idx] = true; \
+				pt_print("  Starting Range: %llx to %llx compared to %llx\n", last_addr, curr_addr, pt_range_start_addr); \
+			} \
+			else if (pt_range_open[pt_range_idx] && curr_addr <= pt_range_end_addr) { \
+				pt_range_open[pt_range_idx] = false; \
+				_PT_TRACE_ADDR_RANGE = false; \
+				pt_print("  Finished Range: %llx to %llx compared to %llx\n", last_addr, curr_addr, pt_range_end_addr); \
+			} \
+		} \
+	} \
+} while (0)
+
+// For dumping traces on system calls
+#define pt_trace_on_syscall() do { \
+	if (_PT_TRACE_SYSCALL) { \
+		pt_print("  Tracing system call\n"); \
+	} \
+} while (0)
+
+
+// Files - used to trigger the APIs
+
+/*
+static ssize_t
+pt_trace_address_write(struct file *filp, const char __user *buf,
+		size_t count, loff_t *ppos)
+{
+	// In progress
+}
+
+static const struct file_operations pt_trace_address_fops = {
+	.write = pt_trace_address_write,
+};
+*/
+
+static int pt_trace_address_setup(void)
+{
+	return 0;
+/*
+	pt_trace_address_dentry = debugfs_create_file("pt_trace_addresses",
+			0600, NULL, NULL, &pt_trace_address_fops);
+	if (!pt_trace_address_dentry) {
+		pt_print("unable to create pt_trace_addresses\n");
+		return -ENOMEM;
+	}
+
+	return 0;
+*/
+}
+
+static void pt_trace_address_destroy(void)
+{
+/*
+	if (pt_trace_address_dentry)
+		debugfs_remove(pt_trace_address_dentry);
+*/
+}
+
+static ssize_t
+pt_trace_syscall_write(struct file *filp, const char __user *buf,
+		size_t count, loff_t *ppos)
+{
+	char mode;
+
+	if (*ppos != 0)
+		return -EINVAL;
+	if (count != 1)
+		return -EINVAL;
+	if (atomic64_read(&pt_flying_tasks))
+		return -EBUSY;
+	if (copy_from_user(&mode, buf, 1))
+		return -EINVAL;
+
+	pt_close_logfile();
+	_PT_TRACE_SYSCALL = true;
+
+	pt_print("tracing system calls\n");
+
+	return 1;
+}
+
+static const struct file_operations pt_trace_syscall_fops = {
+	.write = pt_trace_syscall_write,
+};
+
+static int pt_trace_syscall_setup(void)
+{
+	pt_trace_syscall_dentry = debugfs_create_file("pt_trace_syscall",
+			0600, NULL, NULL, &pt_trace_syscall_fops);
+	if (!pt_trace_syscall_dentry) {
+		pt_print("unable to create pt_trace_syscall\n");
+		return -ENOMEM;
+	}
+
+	return 0;
+}
+
+static void pt_trace_syscall_destroy(void)
+{
+	if (pt_trace_syscall_dentry)
+		debugfs_remove(pt_trace_syscall_dentry);
+}
+
+/** End API Methods **/
 
 
 #pragma pack(push)
@@ -1006,201 +1135,89 @@ pt_get_and_update_ip(unsigned char *packet, u32 len, u64 *last_ip)
 	return ip;
 }
 
-static struct pt_block *pt_disasm_block(u64 addr)
+static void
+pt_follow_packets(char *buffer, u32 size)
 {
-	unsigned int n;
-	struct pt_block *block;
-	_DInst inst;
-	_DecodeResult r;
-	_CodeInfo codeInfo = {
-		.codeOffset = addr,
-		.code = (char *) addr,
-		.codeLen = 0x7fffffff,
-		.dt = Decode64Bits,
-		.features = DF_STOP_ON_FLOW_CONTROL | DF_RETURN_FC_ONLY,
-	};
+	u64 bytes_remained;
+	enum pt_packet_kind kind;
+	unsigned char *packet;
+	u64 packet_len;
+	u64 last_ip = 0; // Used for managing the PT packet IP
+	u64 curr_addr = 0;
+	u64 last_addr = 0; // Used as a cache for PT range triggers
+	u8 mode_payload;
 
-	block = kmem_cache_alloc(pt_block_cache, GFP_KERNEL);
-	memset(block, 0, sizeof(struct pt_block));
-retry:
-	r = distorm_decompose(&codeInfo, &inst, 1, &n);
-	NEVER(n != 1);
-
-	switch (META_GET_FC(inst.meta)) {
-	case FC_CALL:
-		block->kind = inst.ops[0].type == O_PC? PT_BLOCK_DIRECT_CALL: PT_BLOCK_INDIRECT_CALL;
-		block->fallthrough_addr = inst.addr + inst.size;
-		if (block->kind == PT_BLOCK_DIRECT_CALL)
-			block->target_addr = block->fallthrough_addr + inst.imm.sdword;
-		break;
-	case FC_RET:
-		block->kind = PT_BLOCK_RET;
-		block->fallthrough_addr = inst.addr + inst.size;
-		break;
-	case FC_SYS:
-		block->kind = PT_BLOCK_SYSCALL;
-		block->fallthrough_addr = inst.addr + inst.size;
-		break;
-	case FC_UNC_BRANCH:
-		block->kind = inst.ops[0].type == O_PC? PT_BLOCK_DIRECT_JMP: PT_BLOCK_INDIRECT_JMP;
-		block->fallthrough_addr = inst.addr + inst.size;
-		if (block->kind == PT_BLOCK_DIRECT_JMP)
-			block->target_addr = block->fallthrough_addr +
-				(inst.ops[0].size == 32? inst.imm.sdword: inst.imm.sbyte);
-		break;
-	case FC_CND_BRANCH:
-		block->kind = PT_BLOCK_COND_JMP;
-		block->fallthrough_addr = inst.addr + inst.size;
-		block->target_addr = block->fallthrough_addr +
-			(inst.ops[0].size == 32? inst.imm.sdword: inst.imm.sbyte);
-		break;
-	case FC_INT:
-		block->kind = PT_BLOCK_TRAP;
-		block->fallthrough_addr = inst.addr + inst.size;
-		break;
-	case FC_CMOV:
-		codeInfo.code = (char *) codeInfo.nextOffset;
-		codeInfo.codeOffset = codeInfo.nextOffset;
-		goto retry;
-	default:
-		BUG();
-	}
-
-	return block;
-}
-
-static inline struct pt_block *pt_get_block(unsigned long addr)
-{
-	atomic64_t *mirror_addr = (atomic64_t *) PT_IP_TO_BLOCK(addr);
-	struct pt_block *block = (struct pt_block *) atomic64_read(mirror_addr);
-	long new_block;
-
-	if (unlikely(!block)) {
-		block = pt_disasm_block(addr);
-		block->src_index = (*(u16 *) PT_IP_TO_INDEX(block->fallthrough_addr)) - POLICY_ADJUST;
-		block->dst_index = (*(u16 *) PT_IP_TO_INDEX(addr)) - POLICY_ADJUST;
-
-		new_block = atomic64_cmpxchg(mirror_addr, 0, (long) block);
-		if (new_block) {
-			kmem_cache_free(pt_block_cache, block);
-			block = (struct pt_block *) new_block;
-		}
-	}
-
-	return block;
-}
-
-#define pt_in_block(a, b) (pt_get_block(a)->fallthrough_addr == (b)->fallthrough_addr)
-
-#define pt_get_fallthrough_addr(b) (b)->fallthrough_addr
-
-static inline struct pt_block *
-pt_get_fallthrough_block(struct pt_block *block)
-{
-	if (unlikely(!block->fallthrough_block))
-		block->fallthrough_block = pt_get_block(pt_get_fallthrough_addr(block));
-	return block->fallthrough_block;
-}
-
-#define pt_get_target_addr(b) (b)->target_addr
-
-static inline struct pt_block *
-pt_get_target_block(struct pt_block *block)
-{
-	if (unlikely(!block->target_block))
-		block->target_block = pt_get_block(pt_get_target_addr(block));
-	return block->target_block;
-}
-
-#define pt_block_is_call(b) ((b)->kind == PT_BLOCK_DIRECT_CALL || (b)->kind == PT_BLOCK_INDIRECT_CALL)
-
-#define pt_block_is_ret(b) ((b)->kind == PT_BLOCK_RET)
-
-#define pt_block_is_direct(b) ((b)->kind == PT_BLOCK_DIRECT_CALL || (b)->kind == PT_BLOCK_DIRECT_JMP)
-
-#define pt_block_is_cond(b) ((b)->kind == PT_BLOCK_COND_JMP)
-
-#define pt_block_is_syscall(b) ((b)->kind == PT_BLOCK_SYSCALL)
-
-static inline void
-pt_push_raw(pt_event *stack, int *index, pt_event event)
-{
-	UNHANDLED(*index == STACK_MAX);
-	stack[(*index)++] = event;
-}
-
-#define pt_push_call(stack, pindex, event) pt_push_raw(stack, pindex, event)
-
-static inline void
-pt_push_ret(pt_event *stack, int *index, pt_event event)
-{
-	int i;
-
-	for (i = *index - 1; ; i--) {
-		if (i < 0) {
-			*index = 0;
-			break;
-		}
-
-		if (!PT_EVENT_IS_CALL(stack[i])) {
-			*index = i + 1;
-			break;
-		}
-
-		if (stack[i] + event == 0) {
-			*index = i;
-			return;
-		}
-	}
-
-	pt_push_raw(stack, index, event);
-}
-
-static inline void pt_process_buffer(struct pt_buffer *buf)
-{
-	int i;
-	pt_event event;
-	struct topa *topa = buf->topa;
-
-	/* global shadow stack check! */
-	for (i = 0; i < buf->index; i++) {
-		event = buf->stack[i];
-		if (PT_EVENT_IS_CALL(event)) {
-			pt_push_call(topa->stack, &topa->index, event);
-		} else {
-			pt_push_ret(topa->stack, &topa->index, event);
-		}
-	}
-
-	if (buf->child_topa) {
-		NEVER(buf->child_topa->index);
-		buf->child_topa->index = topa->index;
-		memcpy(buf->child_topa->stack, topa->stack,
-				topa->index * sizeof(pt_event));
-	}
-}
-
-#define pt_tsx_begin(stack, pindex) pt_push_raw(stack, pindex, 0)
-
-#define pt_tsx_abort(stack, pindex, xbegin) \
+#define NEXT_PACKET_LITE() \
 do { \
-	NEVER(xbegin < 0); \
-	*(pindex) = xbegin; \
+	bytes_remained -= packet_len; \
+	packet += packet_len; \
+	kind = pt_get_packet(packet, bytes_remained, &packet_len); \
 } while (0)
 
-static inline void
-pt_tsx_commit(pt_event *stack, int *index, int xbegin)
-{
-	int i, old_index = *index;
+	packet = buffer;
+	bytes_remained = size;
 
-	NEVER(xbegin < 0);
-	*index = xbegin;
+	while (bytes_remained > 0) {
+		kind = pt_get_packet(packet, bytes_remained, &packet_len);
+		NEVER(kind == PT_PACKET_ERROR);
+		NEVER(packet_len == 0 || packet_len > bytes_remained);
 
-	for (i = xbegin + 1; i < old_index; i++) {
-		if (PT_EVENT_IS_CALL(stack[i]))
-			pt_push_call(stack, index, stack[i]);
-		else
-			pt_push_ret(stack, index, stack[i]);
+		switch (kind) {
+		case PT_PACKET_TIP:
+		case PT_PACKET_TIPPGE:
+		case PT_PACKET_TIPPGD:
+		case PT_PACKET_FUP:
+			curr_addr = pt_get_and_update_ip(packet, packet_len, &last_ip);
+			break;
+
+		case PT_PACKET_PSB:
+			last_ip = 0;
+			do {
+				NEXT_PACKET_LITE();
+				if (kind == PT_PACKET_FUP)
+					pt_get_and_update_ip(packet, packet_len, &last_ip);
+			} while (kind != PT_PACKET_PSBEND && kind != PT_PACKET_OVF);
+			break;
+
+		case PT_PACKET_MODE:
+			mode_payload = *(packet+1);
+			switch ((mode_payload >> 5)) {
+			case 1: /* MODE.TSX */
+				do {
+					NEXT_PACKET_LITE();
+				} while (kind != PT_PACKET_FUP);
+				curr_addr = pt_get_and_update_ip(packet, packet_len, &last_ip);
+				break;
+			default:
+				break;
+			}
+			break;
+
+		case PT_PACKET_OVF:
+			pt_print("OVF\n");
+			do {
+				NEXT_PACKET_LITE();
+			} while (kind != PT_PACKET_FUP && kind != PT_PACKET_TIPPGE);
+			curr_addr = pt_get_and_update_ip(packet, packet_len, &last_ip);
+			break;
+
+		case PT_PACKET_TNTSHORT:
+		default:
+			break;
+		}
+
+		// First time through, last_addr needs to be set to something
+		// or else it could automatically trigger recording a range
+		if (unlikely(last_addr == 0)) {
+			last_addr = curr_addr;
+		}
+
+		// Based on current address, determine if we trace
+		pt_trace_on_addr_range(last_addr, curr_addr);
+		last_addr = curr_addr;
+
+		bytes_remained -= packet_len;
+		packet += packet_len;
 	}
 }
 
@@ -1209,6 +1226,8 @@ static void pt_work(struct work_struct *work)
 	struct pt_buffer *buf = (struct pt_buffer *) work;
 
 	pt_log_buffer(buf);
+	if (!buf->topa->failed)
+		pt_follow_packets(buf->raw, buf->size);
 	if (buf->notifier)
 		complete(buf->notifier);
 	kmem_cache_free(pt_trace_cache, buf->raw);
@@ -1561,9 +1580,8 @@ void pt_on_syscall(struct pt_regs *regs)
 	}
 
 	pt_pause();
-	pt_print("Found syscall. Going to flush trace first.");
 	pt_flush_trace(NULL, true);
-	//ring_buffer->print_buffer();
+	pt_trace_on_syscall();
 	pt_resume();
 }
 
@@ -1611,10 +1629,24 @@ static int __init pt_init(void)
 
 	memset(pt_monitor, 0, PATH_MAX);
 
+	/* create pt_trace_address file */
+	ret = pt_trace_address_setup();
+	if (ret < 0)
+		goto destroy_monitor;
+
+	/* create pt_trace_syscall file */
+	ret = pt_trace_syscall_setup();
+	if (ret < 0)
+		goto destroy_trace_address;
+
 	pt_print("initialized (distorm version: %x)\n", distorm_version());
 
 	return ret;
 
+destroy_trace_address:
+	pt_trace_address_destroy();
+destroy_monitor:
+	pt_monitor_destroy();
 destroy_wq:
 	pt_wq_destroy();
 destroy_trace_cache:
@@ -1632,6 +1664,8 @@ static void __exit pt_exit(void)
 	NEVER(pt_enabled());
 
 	pt_close_logfile();
+	pt_trace_syscall_destroy();
+	pt_trace_address_destroy();
 	pt_monitor_destroy();
 	pt_wq_destroy();
 	kmem_cache_destroy(pt_ring_item_data_cache);
