@@ -490,9 +490,11 @@ static ssize_t
 pt_trace_syscall_write(struct file *filp, const char __user *buf,
 		size_t count, loff_t *ppos)
 {
-	//char mode;
-	char mode_to_int[2] = {"0\0"};
+	char mode[5];
 	int res = 0;
+
+	// Clear the mode
+	memset(mode, 0, 5);
 
 	if (*ppos != 0)
 		return -EINVAL;
@@ -500,24 +502,20 @@ pt_trace_syscall_write(struct file *filp, const char __user *buf,
 		return -EINVAL;
 	if (atomic64_read(&pt_flying_tasks))
 		return -EBUSY;
-	if (copy_from_user(&mode_to_int, buf, 1))
+	if (copy_from_user(mode, buf, count))
 		return -EINVAL;
 
 	// Pull the number
-	//mode_to_int[0] = mode;
-	_PT_TRACE_SYSCALL_WIDTH = kstrtoint((const char *)&mode_to_int,10,&res);
+	res = kstrtoint((const char *)&mode,10,&_PT_TRACE_SYSCALL_WIDTH);
 
-	pt_print("tracing system calls: %c -> %d\n", mode_to_int[0], _PT_TRACE_SYSCALL_WIDTH);
-
-	// TESTING ONLY
-	_PT_TRACE_SYSCALL_WIDTH = 1;
+	pt_print("tracing system calls: %s -> %d\n", (char *)&mode, _PT_TRACE_SYSCALL_WIDTH);
 
 	// Validate and set
-	if (_PT_TRACE_SYSCALL_WIDTH < 1 || _PT_TRACE_SYSCALL_WIDTH/2 > RING_BUFFER_COUNT) {
+	if (_PT_TRACE_SYSCALL_WIDTH < 1 || (_PT_TRACE_SYSCALL_WIDTH*2 > RING_BUFFER_COUNT)) {
 		pt_print("invalid Griffin syscall buffer width - must be between 1 and 3\n");
 		_PT_TRACE_SYSCALL = false;
 	} else {
-		pt_print("tracing system calls: %c -> %d\n", mode_to_int[0], _PT_TRACE_SYSCALL_WIDTH);
+		pt_print("tracing system calls: %s -> %d\n", (char *)&mode, _PT_TRACE_SYSCALL_WIDTH);
 		_PT_TRACE_SYSCALL = true;
 	}
 
@@ -550,7 +548,11 @@ static ssize_t
 pt_trace_fwd_edge_write(struct file *filp, const char __user *buf,
 		size_t count, loff_t *ppos)
 {
-	char mode;
+	char mode[5];
+	int res = 0;
+
+	// Clear the mode
+	memset(mode, 0, 5);
 
 	if (*ppos != 0)
 		return -EINVAL;
@@ -558,28 +560,20 @@ pt_trace_fwd_edge_write(struct file *filp, const char __user *buf,
 		return -EINVAL;
 	if (atomic64_read(&pt_flying_tasks))
 		return -EBUSY;
-	if (copy_from_user(&mode, buf, 1))
+	if (copy_from_user(mode, buf, count))
 		return -EINVAL;
 
-	pt_print("tracing forward edges\n");
-	_PT_TRACE_FWD_EDGE = true;
-
-	// Pull the number 
-	/*
-	int res = 0;
-	_PT_TRACE_SYSCALL_WIDTH = kstrtoint(&mode,10,&res);
-
-	pt_print("tracing system calls: %c -> %d\n", mode, _PT_TRACE_SYSCALL_WIDTH);
+	// Pull the number
+	res = kstrtoint((const char *)&mode,10,&_PT_TRACE_FWD_EDGE_WIDTH);
 
 	// Validate and set
-	if (_PT_TRACE_SYSCALL_WIDTH < 1 || _PT_TRACE_SYSCALL_WIDTH/2 > RING_BUFFER_COUNT) {
-		pt_print("invalid Griffin fwd_edge buffer width - must be between 1 and 3\n");
-		_PT_TRACE_SYSCALL = false;
+	if (_PT_TRACE_FWD_EDGE_WIDTH < 1 || (_PT_TRACE_FWD_EDGE_WIDTH > RING_BUFFER_COUNT)) {
+		pt_print("invalid Griffin fwd edge buffer size - must be between 1 and %d\n", RING_BUFFER_COUNT);
+		_PT_TRACE_FWD_EDGE = false;
 	} else {
-		pt_print("tracing system calls\n");
-		_PT_TRACE_SYSCALL = true;
+		pt_print("tracing fwd edge CFI violations: %s -> %d\n", (char *)&mode, _PT_TRACE_FWD_EDGE_WIDTH);
+		_PT_TRACE_FWD_EDGE = true;
 	}
-	*/
 
 	return 1;
 }
@@ -610,7 +604,11 @@ static ssize_t
 pt_trace_shadow_stack_write(struct file *filp, const char __user *buf,
 		size_t count, loff_t *ppos)
 {
-	char mode;
+	char mode[5];
+	int res = 0;
+
+	// Clear the mode
+	memset(mode, 0, 5);
 
 	if (*ppos != 0)
 		return -EINVAL;
@@ -618,28 +616,20 @@ pt_trace_shadow_stack_write(struct file *filp, const char __user *buf,
 		return -EINVAL;
 	if (atomic64_read(&pt_flying_tasks))
 		return -EBUSY;
-	if (copy_from_user(&mode, buf, 1))
+	if (copy_from_user(&mode, buf, count))
 		return -EINVAL;
 
-	pt_print("tracing shadow stack\n");
-	_PT_TRACE_SHADOW_STACK = true;
-
-	// Pull the number 
-	/*
-	int res = 0;
-	_PT_TRACE_SYSCALL_WIDTH = kstrtoint(&mode,10,&res);
-
-	pt_print("tracing system calls: %c -> %d\n", mode, _PT_TRACE_SYSCALL_WIDTH);
+	// Pull the number
+	res = kstrtoint((const char *)&mode,10,&_PT_TRACE_SHADOW_STACK_WIDTH);
 
 	// Validate and set
-	if (_PT_TRACE_SYSCALL_WIDTH < 1 || _PT_TRACE_SYSCALL_WIDTH/2 > RING_BUFFER_COUNT) {
-		pt_print("invalid Griffin shadow_stack buffer width - must be between 1 and 3\n");
-		_PT_TRACE_SYSCALL = false;
+	if (_PT_TRACE_SHADOW_STACK_WIDTH < 1 || (_PT_TRACE_SHADOW_STACK_WIDTH > RING_BUFFER_COUNT)) {
+		pt_print("invalid Griffin shadow stack buffer size - must be between 1 and %d\n", RING_BUFFER_COUNT);
+		_PT_TRACE_SHADOW_STACK = false;
 	} else {
-		pt_print("tracing system calls\n");
-		_PT_TRACE_SYSCALL = true;
+		pt_print("tracing shadow stack CFI violations: %s -> %d\n", (char *)&mode, _PT_TRACE_SHADOW_STACK_WIDTH);
+		_PT_TRACE_SHADOW_STACK = true;
 	}
-	*/
 
 	return 1;
 }
