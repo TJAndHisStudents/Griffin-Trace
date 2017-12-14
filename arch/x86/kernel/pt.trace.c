@@ -78,19 +78,14 @@
 	native_read_msr(MSR_IA32_RTIT_OUTPUT_MASK) \
 )
 
-#define NUM_MIRROR_LAYER 10
 #define MIRROR_DISTANCE 0x010000000000
 #define MIRROR(addr, level) (((addr) + (level) * MIRROR_DISTANCE) & 0x7fffffffffff)
 #define PT_IP_TO_BLOCK(addr) MIRROR((addr) & ~0x7, ((addr) & 0x7) + 1)
 #define PT_IP_TO_INDEX(addr) MIRROR((addr) & ~0x1, ((addr) & 0x1) + 9)
 
-#define POLICY_MATRIX 0x400000000000
-#define POLICY_LENGTH 0x10000
-#define POLICY_SIZE (u64)((u64)POLICY_LENGTH * (u64)POLICY_LENGTH)
 #define POLICY_ADJUST 1
 #define POLICY_RSVD ((u16)-POLICY_ADJUST)
-#define POLICY_CHECK(src, dst) ((src == POLICY_RSVD) || (dst != POLICY_RSVD && \
-	 test_bit(src * POLICY_LENGTH + dst, (const void *) POLICY_MATRIX)))
+
 
 enum pt_block_kind {
 	PT_BLOCK_DIRECT_CALL,
@@ -114,8 +109,6 @@ struct pt_block {
 };
 
 typedef long pt_event;
-#define PT_EVENT_IS_CALL(e) ((e) > 0)
-#define PT_EVENT_IS_RET(e) ((e) < 0)
 
 struct topa_entry {
 	u64 end:1;
@@ -187,8 +180,6 @@ static struct workqueue_struct *pt_wq;
 
 static atomic64_t pt_flying_tasks = ATOMIC_INIT(0);
 
-static struct dentry *pt_policy_dentry = NULL;
-
 static struct file *pt_logfile = NULL;
 static loff_t pt_logfile_off = 0;
 static DEFINE_MUTEX(pt_logfile_mtx);
@@ -208,7 +199,6 @@ static DEFINE_MUTEX(pt_logfile_mtx);
 	UNHANDLED(s < 0); \
 	pt_logfile_off += s; \
 } while (0)
-
 
 
 /** Ring Buffer storage of packets **/
@@ -235,7 +225,7 @@ struct pt_ring_buffer {
 	struct pt_ring_item * curr;
 	struct pt_ring_item * head;
 	void (* add_ring_item)(void *, ssize_t);
-	void (* print_buffer)(unsigned int);
+	void (* print_buffer)(void);
 };
 
 static struct pt_ring_buffer * ring_buffer;
@@ -278,14 +268,8 @@ void add_ring_item(void * data, ssize_t data_length) {
 	ring_buffer->curr = ring_buffer->curr->next;
 }
 
-void print_buffer(unsigned int max_number_of_buffers) {
-	// Set the minimum print index
-	unsigned int minimum_print_index, current_print_index, first_index;
-
-	// Impose limits on the max number of buffers - if we break them, just show all
-	if (max_number_of_buffers <= 0 || max_number_of_buffers > RING_BUFFER_COUNT) {
-		max_number_of_buffers = RING_BUFFER_COUNT;
-	}
+void print_buffer(void) {
+	unsigned int first_index;
 
 	// Validate that we have a buffer to print
 	if (ring_buffer == NULL || ring_buffer->curr == NULL) {
@@ -307,23 +291,11 @@ void print_buffer(unsigned int max_number_of_buffers) {
 		return;
 	}
 
-	// Set the minimum print index
-	minimum_print_index = RING_BUFFER_COUNT - max_number_of_buffers;
-	current_print_index = 0;
-
 	// Print all of the buffers
 	// Use do-while because we want to stop at the same index as the one we started with
 	do {
-		// Only print if we should
-		if (current_print_index >= minimum_print_index) {
-			pt_print("Printing buffer #%d to %d, size (%zd)\n", ring_buffer->curr->index, first_index, ring_buffer->curr->data_length);
-			pt_log(ring_buffer->curr->data, ring_buffer->curr->data_length);
-		}
-
-		// Increment print index
-		current_print_index++;
-
-		// Move to the next ring item
+		pt_print("Printing buffer #%d to %d, size (%zd)\n", ring_buffer->curr->index, first_index, ring_buffer->curr->data_length);
+		pt_log(ring_buffer->curr->data, ring_buffer->curr->data_length);
 		ring_buffer->curr = ring_buffer->curr->next;
 	} while (
 		ring_buffer->curr != NULL && 
@@ -392,12 +364,9 @@ static struct dentry *pt_trace_shadow_stack_dentry;
 static bool _PT_TRACE_SYSCALL      = false;
 static bool _PT_TRACE_FWD_EDGE     = false;
 static bool _PT_TRACE_SHADOW_STACK = false;
-static bool _PT_TRACE_PROC_END     = false;
 
 // Number of buffers before and after. No larger than {ring buffer max}/2.
 static int _PT_TRACE_SYSCALL_WIDTH = 1;
-static int _PT_TRACE_FWD_EDGE_WIDTH = 1;
-static int _PT_TRACE_SHADOW_STACK_WIDTH = 1;
 
 // For dumping traces within address ranges
 // If these are ordered, we can search through them quickly
@@ -430,9 +399,7 @@ static bool pt_range_open[10]           = {false,false,false,false,false,false,f
 } while (0)
 */
 
-// Keep track of when we need to dump a trace
-static bool pt_trace_fwd_edge_trigger = false;
-static bool pt_trace_shadow_stack_trigger = false;
+// Keep track of when we need to dump a trace due to a syscall
 static bool pt_trace_syscall_trigger = false;
 static int pt_trace_syscall_trigger_rb_index = -1;
 
@@ -443,7 +410,7 @@ static int pt_trace_syscall_trigger_rb_index = -1;
 		if (pt_trace_syscall_trigger_rb_index == -1) { \
 			pt_trace_syscall_trigger_rb_index = ring_buffer->curr->index; \
 		} \
-		pt_print("  System call captured. Will print to log.\n"); \
+		pt_print("  System call captured. Will print to log in X buffers.\n"); \
 	} \
 } while (0)
 
@@ -503,21 +470,20 @@ pt_trace_syscall_write(struct file *filp, const char __user *buf,
 	if (copy_from_user(&mode_to_int, buf, 1))
 		return -EINVAL;
 
+	pt_close_logfile();
+
 	// Pull the number
 	//mode_to_int[0] = mode;
 	_PT_TRACE_SYSCALL_WIDTH = kstrtoint((const char *)&mode_to_int,10,&res);
 
 	pt_print("tracing system calls: %c -> %d\n", mode_to_int[0], _PT_TRACE_SYSCALL_WIDTH);
 
-	// TESTING ONLY
-	_PT_TRACE_SYSCALL_WIDTH = 1;
-
 	// Validate and set
 	if (_PT_TRACE_SYSCALL_WIDTH < 1 || _PT_TRACE_SYSCALL_WIDTH/2 > RING_BUFFER_COUNT) {
 		pt_print("invalid Griffin syscall buffer width - must be between 1 and 3\n");
 		_PT_TRACE_SYSCALL = false;
 	} else {
-		pt_print("tracing system calls: %c -> %d\n", mode_to_int[0], _PT_TRACE_SYSCALL_WIDTH);
+		pt_print("tracing system calls\n");
 		_PT_TRACE_SYSCALL = true;
 	}
 
@@ -560,6 +526,8 @@ pt_trace_fwd_edge_write(struct file *filp, const char __user *buf,
 		return -EBUSY;
 	if (copy_from_user(&mode, buf, 1))
 		return -EINVAL;
+
+	pt_close_logfile();
 
 	pt_print("tracing forward edges\n");
 	_PT_TRACE_FWD_EDGE = true;
@@ -620,6 +588,8 @@ pt_trace_shadow_stack_write(struct file *filp, const char __user *buf,
 		return -EBUSY;
 	if (copy_from_user(&mode, buf, 1))
 		return -EINVAL;
+
+	pt_close_logfile();
 
 	pt_print("tracing shadow stack\n");
 	_PT_TRACE_SHADOW_STACK = true;
@@ -686,7 +656,11 @@ static void pt_log_header(void)
 	};
 
 	mutex_lock(&pt_logfile_mtx);
+	
+	// We need to include the header in the PT file no matter what
 	pt_log(&h, sizeof(h));
+	//ring_buffer->add_ring_item(&h, sizeof(h));
+
 	mutex_unlock(&pt_logfile_mtx);
 }
 
@@ -728,6 +702,7 @@ static void pt_log_buffer(struct pt_buffer *buf)
 		.size = buf->size,
 	};
 
+	// Add the new ring item
 	mutex_lock(&pt_logfile_mtx);
 	ring_buffer->add_ring_item(&item, sizeof(item));
 	ring_buffer->add_ring_item(buf->raw, buf->size);
@@ -759,6 +734,7 @@ static void pt_log_thread(struct task_struct *task)
 
 	mutex_lock(&pt_logfile_mtx);
 	pt_log(&item, sizeof(item));
+	//ring_buffer->add_ring_item(&item, sizeof(item));
 	mutex_unlock(&pt_logfile_mtx);
 }
 
@@ -776,7 +752,9 @@ static void pt_log_process(struct task_struct *task)
 
 	mutex_lock(&pt_logfile_mtx);
 	pt_log(&item, sizeof(item));
+	//ring_buffer->add_ring_item(&item, sizeof(item));
 	pt_log(pt_monitor, item.cmd_size);
+	//ring_buffer->add_ring_item(pt_monitor, item.cmd_size);
 	mutex_unlock(&pt_logfile_mtx);
 
 	pt_log_thread(task);
@@ -828,17 +806,21 @@ static void pt_log_xpage(struct task_struct *task, u64 base,
 	mutex_lock(&pt_logfile_mtx);
 
 	pt_log(&item, sizeof(item));
+	//ring_buffer->add_ring_item(&item, sizeof(item));
 
 	for (i = 0; i < nr_real_pages; i++) {
 		ret = access_process_vm(task, base + i * PAGE_SIZE,
 				page, PAGE_SIZE, 0);
 		UNHANDLED(ret != PAGE_SIZE);
 		pt_log(page, PAGE_SIZE);
+		//ring_buffer->add_ring_item(page, PAGE_SIZE);
 	}
 
 	memset(page, 0, PAGE_SIZE);
-	for (i = 0; i < nr_pages - nr_real_pages; i++)
+	for (i = 0; i < nr_pages - nr_real_pages; i++) {
 		pt_log(page, PAGE_SIZE);
+		//ring_buffer->add_ring_item(page, PAGE_SIZE);
+	}
 
 	mutex_unlock(&pt_logfile_mtx);
 
@@ -875,6 +857,7 @@ static void pt_log_fork(struct task_struct *parent,
 
 	mutex_lock(&pt_logfile_mtx);
 	pt_log(&item, item.header.size);
+	//ring_buffer->add_ring_item(&item, item.header.size);
 	mutex_unlock(&pt_logfile_mtx);
 }
 
@@ -911,18 +894,7 @@ pt_monitor_write(struct file *filp, const char __user *buf,
 	pt_log_header();
 	workqueue_set_max_active(pt_wq, 1);
 
-	// Reset the PT watch triggers
-	_PT_TRACE_FWD_EDGE = false;
-	_PT_TRACE_SHADOW_STACK = false;
-	_PT_TRACE_SYSCALL = false;
-	pt_trace_fwd_edge_trigger = false;
-	pt_trace_shadow_stack_trigger = false;
-	pt_trace_syscall_trigger = false;
-	pt_trace_syscall_trigger_rb_index = -1;
-
-	// TODO: Clear out the PT Buffers here
-
-	pt_print("offline: %s registered\n", pt_monitor);
+	pt_print("tracing: %s registered\n", pt_monitor);
 
 	return count;
 }
@@ -948,97 +920,6 @@ static void pt_monitor_destroy(void)
 {
 	if (pt_monitor_dentry)
 		debugfs_remove(pt_monitor_dentry);
-}
-
-static ssize_t
-pt_policy_write(struct file *filp, const char __user *buf,
-		size_t count, loff_t *ppos)
-{
-	u32 total, bytes, nrows, ncols;
-	u32 i, ret, offset = 0;
-	char *row = NULL;
-	struct {
-		u64 addr;
-		u32 is_target;
-		u16 index;
-		u16 padding;
-	} mapping;
-
-#define SAFE_READ(dest, n) \
-do { \
-	if (offset + (n) > count) \
-		return -EINVAL; \
-	if (copy_from_user((dest), buf + offset, (n))) \
-		return -EINVAL; \
-	offset += (n); \
-} while (0)
-
-#define ROW_SIZE (ncols / 8)
-
-	if (!pt_enabled())
-		return -EINVAL;
-	if (*ppos != 0)
-		return -EINVAL;
-
-	SAFE_READ(&total, sizeof(total));
-	if (!total) {
-		pt_print("empty policy?\n");
-		return -EINVAL;
-	}
-
-	for (i = 0; i < total; i++) {
-		SAFE_READ(&mapping, sizeof(mapping));
-		mapping.index += POLICY_ADJUST;
-		ret = access_process_vm(current, PT_IP_TO_INDEX(mapping.addr),
-				&mapping.index, sizeof(mapping.index), 1);
-		if (ret != sizeof(mapping.index))
-			return -EINVAL;
-	}
-
-	SAFE_READ(&nrows, sizeof(nrows));
-	SAFE_READ(&ncols, sizeof(ncols));
-	if (ncols & 0x7) {
-		pt_print("ncols must be a multiply of eight\n");
-		return -EINVAL;
-	}
-
-	row = (char *) kmalloc(ROW_SIZE, GFP_KERNEL);
-	if (!row)
-		return -ENOMEM;
-
-	bytes = (nrows * ncols) / 8;
-
-	for (i = 0; i < nrows; i++) {
-		SAFE_READ(row, ROW_SIZE);
-		ret = access_process_vm(current, POLICY_MATRIX + i * POLICY_LENGTH / 8,
-				row, ROW_SIZE, 1);
-		if (ret != ROW_SIZE)
-			return -EINVAL;
-	}
-
-	return count;
-}
-
-static const struct file_operations pt_policy_fops = {
-	.write = pt_policy_write,
-};
-
-static int pt_policy_setup(void)
-{
-	pt_policy_dentry = debugfs_create_file("pt_policy",
-			0600, NULL, NULL, &pt_policy_fops);
-	if (!pt_policy_dentry) {
-		pt_print("unable to create pt_policy\n");
-		return -ENOMEM;
-	}
-
-	return 0;
-}
-
-static void pt_policy_destroy(void)
-{
-	if (pt_policy_dentry)
-		debugfs_remove(pt_policy_dentry);
 }
 
 static int pt_wq_setup(void)
@@ -1409,312 +1290,24 @@ pt_get_and_update_ip(unsigned char *packet, u32 len, u64 *last_ip)
 	return ip;
 }
 
-static struct pt_block *pt_disasm_block(u64 addr)
-{
-	unsigned int n;
-	struct pt_block *block;
-	_DInst inst;
-	_DecodeResult r;
-	_CodeInfo codeInfo = {
-		.codeOffset = addr,
-		.code = (char *) addr,
-		.codeLen = 0x7fffffff,
-		.dt = Decode64Bits,
-		.features = DF_STOP_ON_FLOW_CONTROL | DF_RETURN_FC_ONLY,
-	};
-
-	block = kmem_cache_alloc(pt_block_cache, GFP_KERNEL);
-	memset(block, 0, sizeof(struct pt_block));
-retry:
-	r = distorm_decompose(&codeInfo, &inst, 1, &n);
-	NEVER(n != 1);
-
-	switch (META_GET_FC(inst.meta)) {
-	case FC_CALL:
-		block->kind = inst.ops[0].type == O_PC? PT_BLOCK_DIRECT_CALL: PT_BLOCK_INDIRECT_CALL;
-		block->fallthrough_addr = inst.addr + inst.size;
-		if (block->kind == PT_BLOCK_DIRECT_CALL)
-			block->target_addr = block->fallthrough_addr + inst.imm.sdword;
-		break;
-	case FC_RET:
-		block->kind = PT_BLOCK_RET;
-		block->fallthrough_addr = inst.addr + inst.size;
-		break;
-	case FC_SYS:
-		block->kind = PT_BLOCK_SYSCALL;
-		block->fallthrough_addr = inst.addr + inst.size;
-		break;
-	case FC_UNC_BRANCH:
-		block->kind = inst.ops[0].type == O_PC? PT_BLOCK_DIRECT_JMP: PT_BLOCK_INDIRECT_JMP;
-		block->fallthrough_addr = inst.addr + inst.size;
-		if (block->kind == PT_BLOCK_DIRECT_JMP)
-			block->target_addr = block->fallthrough_addr +
-				(inst.ops[0].size == 32? inst.imm.sdword: inst.imm.sbyte);
-		break;
-	case FC_CND_BRANCH:
-		block->kind = PT_BLOCK_COND_JMP;
-		block->fallthrough_addr = inst.addr + inst.size;
-		block->target_addr = block->fallthrough_addr +
-			(inst.ops[0].size == 32? inst.imm.sdword: inst.imm.sbyte);
-		break;
-	case FC_INT:
-		block->kind = PT_BLOCK_TRAP;
-		block->fallthrough_addr = inst.addr + inst.size;
-		break;
-	case FC_CMOV:
-		codeInfo.code = (char *) codeInfo.nextOffset;
-		codeInfo.codeOffset = codeInfo.nextOffset;
-		goto retry;
-	default:
-		BUG();
-	}
-
-	return block;
-}
-
-static inline struct pt_block *pt_get_block(unsigned long addr)
-{
-	atomic64_t *mirror_addr = (atomic64_t *) PT_IP_TO_BLOCK(addr);
-	struct pt_block *block = (struct pt_block *) atomic64_read(mirror_addr);
-	long new_block;
-
-	if (unlikely(!block)) {
-		block = pt_disasm_block(addr);
-		block->src_index = (*(u16 *) PT_IP_TO_INDEX(block->fallthrough_addr)) - POLICY_ADJUST;
-		block->dst_index = (*(u16 *) PT_IP_TO_INDEX(addr)) - POLICY_ADJUST;
-
-		new_block = atomic64_cmpxchg(mirror_addr, 0, (long) block);
-		if (new_block) {
-			kmem_cache_free(pt_block_cache, block);
-			block = (struct pt_block *) new_block;
-		}
-	}
-
-	return block;
-}
-
-#define pt_in_block(a, b) (pt_get_block(a)->fallthrough_addr == (b)->fallthrough_addr)
-
-#define pt_get_fallthrough_addr(b) (b)->fallthrough_addr
-
-static inline struct pt_block *
-pt_get_fallthrough_block(struct pt_block *block)
-{
-	if (unlikely(!block->fallthrough_block))
-		block->fallthrough_block = pt_get_block(pt_get_fallthrough_addr(block));
-	return block->fallthrough_block;
-}
-
-#define pt_get_target_addr(b) (b)->target_addr
-
-static inline struct pt_block *
-pt_get_target_block(struct pt_block *block)
-{
-	if (unlikely(!block->target_block))
-		block->target_block = pt_get_block(pt_get_target_addr(block));
-	return block->target_block;
-}
-
-#define pt_block_is_call(b) ((b)->kind == PT_BLOCK_DIRECT_CALL || (b)->kind == PT_BLOCK_INDIRECT_CALL)
-
-#define pt_block_is_ret(b) ((b)->kind == PT_BLOCK_RET)
-
-#define pt_block_is_direct(b) ((b)->kind == PT_BLOCK_DIRECT_CALL || (b)->kind == PT_BLOCK_DIRECT_JMP)
-
-#define pt_block_is_cond(b) ((b)->kind == PT_BLOCK_COND_JMP)
-
-#define pt_block_is_syscall(b) ((b)->kind == PT_BLOCK_SYSCALL)
-
-static inline void
-pt_push_raw(pt_event *stack, int *index, pt_event event)
-{
-	UNHANDLED(*index == STACK_MAX);
-	stack[(*index)++] = event;
-}
-
-#define pt_push_call(stack, pindex, event) pt_push_raw(stack, pindex, event)
-
-static inline void
-pt_push_ret(pt_event *stack, int *index, pt_event event)
-{
-	int i;
-
-	for (i = *index - 1; ; i--) {
-		if (i < 0) {
-			*index = 0;
-			break;
-		}
-
-		if (!PT_EVENT_IS_CALL(stack[i])) {
-			*index = i + 1;
-			break;
-		}
-
-		if (stack[i] + event == 0) {
-			*index = i;
-			return;
-		}
-	}
-
-	pt_push_raw(stack, index, event);
-}
-
-static inline void pt_process_buffer(struct pt_buffer *buf)
-{
-	int i;
-	pt_event event;
-	struct topa *topa = buf->topa;
-
-	/* global shadow stack check! */
-	for (i = 0; i < buf->index; i++) {
-		event = buf->stack[i];
-		if (PT_EVENT_IS_CALL(event)) {
-			pt_push_call(topa->stack, &topa->index, event);
-		} else {
-			pt_push_ret(topa->stack, &topa->index, event);
-			if (PT_EVENT_IS_RET(topa->stack[0])) {
-				// Notify
-				pt_fail_topa(topa, "unmatched return: %llx",
-						(u64) -topa->stack[0]);
-
-				if (_PT_TRACE_SHADOW_STACK) {
-					pt_trace_shadow_stack_trigger = true;
-				}
-
-				return;
-			}
-		}
-	}
-
-	if (buf->child_topa) {
-		NEVER(buf->child_topa->index);
-		buf->child_topa->index = topa->index;
-		memcpy(buf->child_topa->stack, topa->stack,
-				topa->index * sizeof(pt_event));
-	}
-}
-
-static void pt_submit_buffer(struct pt_buffer *buf)
-{
-	unsigned long flags;
-	struct completion *notifier;
-	struct pt_buffer *child_buf;
-	struct topa *child_topa, *topa = buf->topa;
-	u64 sequence = buf->sequence;
-
-	spin_lock_irqsave(&topa->buffer_list_sl, flags);
-	if (topa->n_processed == sequence) {
-		do {
-			list_del(&buf->entry);
-			spin_unlock_irqrestore(&topa->buffer_list_sl, flags);
-			pt_process_buffer(buf);
-			if ((child_topa = buf->child_topa) && topa->failed)
-				pt_fail_topa(child_topa, "parent failed");
-			if (child_topa) {
-				child_buf = kmem_cache_alloc(pt_buffer_cache, GFP_KERNEL);
-				INIT_LIST_HEAD(&child_buf->entry);
-				child_buf->topa = child_topa;
-				child_buf->child_topa = NULL;
-				child_buf->notifier = NULL;
-				child_buf->sequence = sequence;
-				child_buf->raw = NULL;
-				child_buf->size = 0;
-				child_buf->index = 0;
-				child_buf->stack = NULL;
-				pt_submit_buffer(child_buf);
-			}
-			topa->n_processed++;
-			notifier = buf->notifier;
-			free_pages((unsigned long) buf->stack, STACK_PAGE_ORDER);
-			kmem_cache_free(pt_buffer_cache, buf);
-			if (notifier) {
-				complete(notifier);
-				return;
-			}
-			/* find the next buffer */
-			sequence++;
-			spin_lock_irqsave(&topa->buffer_list_sl, flags);
-			list_for_each_entry(buf, &topa->buffer_list, entry)
-				if (buf->sequence == sequence)
-					break;
-		} while (&buf->entry != &topa->buffer_list);
-	} else {
-		list_add_tail(&buf->entry, &topa->buffer_list);
-	}
-	spin_unlock_irqrestore(&topa->buffer_list_sl, flags);
-}
-
-#define pt_tsx_begin(stack, pindex) pt_push_raw(stack, pindex, 0)
-
-#define pt_tsx_abort(stack, pindex, xbegin) \
-do { \
-	NEVER(xbegin < 0); \
-	*(pindex) = xbegin; \
-} while (0)
-
-static inline void
-pt_tsx_commit(pt_event *stack, int *index, int xbegin)
-{
-	int i, old_index = *index;
-
-	NEVER(xbegin < 0);
-	*index = xbegin;
-
-	for (i = xbegin + 1; i < old_index; i++) {
-		if (PT_EVENT_IS_CALL(stack[i]))
-			pt_push_call(stack, index, stack[i]);
-		else
-			pt_push_ret(stack, index, stack[i]);
-	}
-}
-
 static void
-pt_recover(char *buffer, u32 size, pt_event stack[], int *index)
+pt_follow_packets(char *buffer, u32 size)
 {
 	u64 bytes_remained;
 	enum pt_packet_kind kind;
 	unsigned char *packet;
 	u64 packet_len;
-	u64 last_ip = 0;
+	u64 last_ip = 0; // Used for managing the PT packet IP
 	u64 curr_addr = 0;
-	u8 mask;
-	u8 bit_selector;
-	struct pt_block *curr_block = NULL;
-#define RETC_STACK_SIZE 64
-	struct pt_block *retc[RETC_STACK_SIZE] = {0};
-	u32 retc_index = 0;
+	u64 last_addr = 0; // Used as a cache for PT range triggers
 	u8 mode_payload;
-	int si = *index;
-	int xbegin = -1;
-	unsigned short src_index = POLICY_RSVD;
 
-#define PUSH_CALL(addr) pt_push_call(stack, &si, addr)
-#define PUSH_RET(addr) \
-do { \
-	if (*(u64 *)(addr) != 0x0f0000000fc0c748 || *(u8 *)(addr + 8) != 0x05) \
-		pt_push_ret(stack, &si, -addr); \
-} while (0)
-
-#define NEXT_PACKET() \
+#define NEXT_PACKET_LITE() \
 do { \
 	bytes_remained -= packet_len; \
 	packet += packet_len; \
 	kind = pt_get_packet(packet, bytes_remained, &packet_len); \
 } while (0)
-
-#define FOLLOW_DIRECT_UNTIL(cond) \
-do { \
-	while (pt_block_is_direct(curr_block) && (!(cond))) { \
-		if (pt_block_is_call(curr_block)) { \
-			PUSH_CALL(pt_get_fallthrough_addr(curr_block)); \
-			retc[retc_index] = curr_block; \
-			retc_index = (retc_index + 1) % RETC_STACK_SIZE; \
-		} \
-		curr_block = pt_get_target_block(curr_block); \
-	} \
-} while(0)
-
-#define FOLLOW_DIRECT() FOLLOW_DIRECT_UNTIL(false)
 
 	packet = buffer;
 	bytes_remained = size;
@@ -1725,81 +1318,17 @@ do { \
 		NEVER(packet_len == 0 || packet_len > bytes_remained);
 
 		switch (kind) {
-		case PT_PACKET_TNTSHORT:
-			mask = (u8)*packet;
-			bit_selector = 1 << (fls(mask) - 1);
-			NEVER((mask & bit_selector) == 0);
-			do {
-				FOLLOW_DIRECT();
-				if (mask & (bit_selector >>= 1)) {
-					if (pt_block_is_ret(curr_block)) {
-						retc_index = (retc_index + RETC_STACK_SIZE - 1) % RETC_STACK_SIZE;
-						PUSH_RET(pt_get_fallthrough_addr(retc[retc_index]));
-						curr_block = pt_get_fallthrough_block(retc[retc_index]);
-					} else {
-						curr_block = pt_get_target_block(curr_block);
-					}
-				} else {
-					NEVER(pt_block_is_ret(curr_block));
-					curr_block = pt_get_fallthrough_block(curr_block);
-				}
-			} while (bit_selector != 2);
-			break;
-
 		case PT_PACKET_TIP:
-			curr_addr = pt_get_and_update_ip(packet, packet_len, &last_ip);
-			src_index = POLICY_RSVD;
-
-			if (curr_block) {
-				FOLLOW_DIRECT();
-				NEVER(pt_block_is_cond(curr_block));
-
-				if (pt_block_is_ret(curr_block)) {
-					PUSH_RET(curr_addr);
-				} else {
-					src_index = curr_block->src_index;
-					if (pt_block_is_call(curr_block)) {
-						PUSH_CALL(pt_get_fallthrough_addr(curr_block));
-						retc[retc_index] = curr_block;
-						retc_index = (retc_index + 1) % RETC_STACK_SIZE;
-					}
-				}
-			}
-
-			curr_block = pt_get_block(curr_addr);
-
-			if (!POLICY_CHECK(src_index, curr_block->dst_index)) {
-				// Notify
-				pt_print("forward-edge violation: %u -> %u (%llx)\n",
-						src_index, curr_block->dst_index, curr_addr);
-
-				if (_PT_TRACE_FWD_EDGE) {
-					pt_trace_fwd_edge_trigger = true;
-				}
-			}
-			break;
-
 		case PT_PACKET_TIPPGE:
-			curr_addr = pt_get_and_update_ip(packet, packet_len, &last_ip);
-			curr_block = pt_get_block(curr_addr);
-			break;
-
 		case PT_PACKET_TIPPGD:
-			if (curr_block)
-				FOLLOW_DIRECT();
-			pt_get_and_update_ip(packet, packet_len, &last_ip);
-			break;
-
 		case PT_PACKET_FUP:
 			curr_addr = pt_get_and_update_ip(packet, packet_len, &last_ip);
-			FOLLOW_DIRECT_UNTIL(pt_in_block(curr_addr, curr_block));
-			curr_block = NULL;
 			break;
 
 		case PT_PACKET_PSB:
 			last_ip = 0;
 			do {
-				NEXT_PACKET();
+				NEXT_PACKET_LITE();
 				if (kind == PT_PACKET_FUP)
 					pt_get_and_update_ip(packet, packet_len, &last_ip);
 			} while (kind != PT_PACKET_PSBEND && kind != PT_PACKET_OVF);
@@ -1808,34 +1337,11 @@ do { \
 		case PT_PACKET_MODE:
 			mode_payload = *(packet+1);
 			switch ((mode_payload >> 5)) {
-			case 0: /* MODE.Exec */
-				UNHANDLED((mode_payload & (u8)0x3) != 1);
-				break;
 			case 1: /* MODE.TSX */
 				do {
-					NEXT_PACKET();
+					NEXT_PACKET_LITE();
 				} while (kind != PT_PACKET_FUP);
 				curr_addr = pt_get_and_update_ip(packet, packet_len, &last_ip);
-				FOLLOW_DIRECT_UNTIL(pt_in_block(curr_addr, curr_block));
-
-				switch ((mode_payload & (u8)0x3)) {
-				case 0:
-					pt_tsx_commit(stack, &si, xbegin);
-					xbegin = -1;
-					break;
-				case 1:
-					NEVER(xbegin != -1);
-					pt_tsx_begin(stack, &si);
-					xbegin = si - 1;
-					break;
-				case 2:
-					pt_tsx_abort(stack, &si, xbegin);
-					xbegin = -1;
-					curr_block = NULL;
-					break;
-				default:
-					break;
-				}
 				break;
 			default:
 				break;
@@ -1845,82 +1351,54 @@ do { \
 		case PT_PACKET_OVF:
 			pt_print("OVF\n");
 			do {
-				NEXT_PACKET();
+				NEXT_PACKET_LITE();
 			} while (kind != PT_PACKET_FUP && kind != PT_PACKET_TIPPGE);
 			curr_addr = pt_get_and_update_ip(packet, packet_len, &last_ip);
-			curr_block = pt_get_block(curr_addr);
 			break;
 
+		case PT_PACKET_TNTSHORT:
 		default:
 			break;
 		}
 
+		// First time through, last_addr needs to be set to something
+		// or else it could automatically trigger recording a range
+		if (unlikely(last_addr == 0)) {
+			last_addr = curr_addr;
+		}
+
+		// Based on current address, determine if we trace
+		//pt_trace_on_addr_range(last_addr, curr_addr);
+		last_addr = curr_addr;
+
 		bytes_remained -= packet_len;
 		packet += packet_len;
 	}
-
-	*index = si;
 }
 
 static void pt_work(struct work_struct *work)
 {
-	mm_segment_t oldfs;
-	struct mm_struct *mm;
 	struct pt_buffer *buf = (struct pt_buffer *) work;
 
-	// Log the buffer first
 	pt_log_buffer(buf);
-
-	// Then go ahead and build the mirror pages
-	oldfs = get_fs();
-	mm = buf->topa->task->mm;
-	set_fs(USER_DS);
-	use_mm(mm);
-	stac();
-
 	if (!buf->topa->failed)
-		pt_recover(buf->raw, buf->size, buf->stack, &buf->index);
-
+		pt_follow_packets(buf->raw, buf->size);
+	if (buf->notifier)
+		complete(buf->notifier);
 	kmem_cache_free(pt_trace_cache, buf->raw);
-	pt_submit_buffer(buf);
+	kmem_cache_free(pt_buffer_cache, buf);
 
-	clac();
-	unuse_mm(mm);
-	set_fs(oldfs);
-
-	// Write any existing ring items - syscall
+	// Write any existing ring items
 	if (pt_trace_syscall_trigger && pt_trace_syscall_trigger_rb_index > -1 &&
-		(pt_trace_syscall_trigger_rb_index + _PT_TRACE_SYSCALL_WIDTH)%RING_BUFFER_COUNT >= (ring_buffer->curr->index)%RING_BUFFER_COUNT)
+		(pt_trace_syscall_trigger_rb_index + _PT_TRACE_SYSCALL_WIDTH)%RING_BUFFER_COUNT == (ring_buffer->curr->index + _PT_TRACE_SYSCALL_WIDTH)%RING_BUFFER_COUNT)
 	{
-		// Write the existing ring buffers
-		pt_print("  Dumping trace from syscall trigger. Called on %d, dumped on %d, width is %d.", pt_trace_syscall_trigger_rb_index, ring_buffer->curr->index, _PT_TRACE_SYSCALL_WIDTH);
-		ring_buffer->print_buffer(_PT_TRACE_SYSCALL_WIDTH * 2);
-
 		// Unset the triggers
 		pt_trace_syscall_trigger = false;
 		pt_trace_syscall_trigger_rb_index = -1;
-	}
 
-	// Write any existing ring items - forward edge
-	if (pt_trace_fwd_edge_trigger)
-	{
 		// Write the existing ring buffers
-		pt_print("  Dumping trace from CFI forward edge trigger.");
-		ring_buffer->print_buffer(_PT_TRACE_FWD_EDGE_WIDTH);
-
-		// Unset the trigger
-		pt_trace_fwd_edge_trigger = false;
-	}
-
-	// Write any existing ring items - shadow stack
-	if (pt_trace_shadow_stack_trigger)
-	{
-		// Write the existing ring buffers
-		pt_print("  Dumping trace from CFI shadow stack trigger.");
-		ring_buffer->print_buffer(_PT_TRACE_SHADOW_STACK_WIDTH);
-
-		// Unset the trigger
-		pt_trace_shadow_stack_trigger = false;
+		pt_print("  Dumping trace from syscall trigger.");
+		ring_buffer->print_buffer();
 	}
 }
 
@@ -1950,12 +1428,6 @@ static int pt_move_trace_to_work(struct topa *topa, u32 size,
 	buf->size = size;
 	buf->index = 0;
 	buf->raw = topa->raw;
-
-	buf->stack = (pt_event *) __get_free_pages(GFP_ATOMIC,
-			STACK_PAGE_ORDER);
-	if (!buf->stack)
-		goto free_buf;
-
 	buf->sequence = topa->sequence++;
 
 	tasklet_schedule(&buf->tasklet);
@@ -1965,8 +1437,6 @@ static int pt_move_trace_to_work(struct topa *topa, u32 size,
 
 	return 0;
 
-free_buf:
-	kmem_cache_free(pt_buffer_cache, buf);
 fail:
 	return -ENOMEM;
 }
@@ -2070,24 +1540,6 @@ up_read_sem:
 	return monitored;
 }
 
-static unsigned long pt_mirror_page(unsigned long addr, unsigned long len)
-{
-	int i;
-	unsigned long ret, populate;
-
-	for (i = 1; i <= NUM_MIRROR_LAYER; i++) {
-		down_write(&current->mm->mmap_sem);
-		ret = do_mmap_pgoff(NULL, MIRROR(addr, i), len, PROT_READ
-				| PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS
-				| MAP_FIXED, 0, &populate);
-		up_write(&current->mm->mmap_sem);
-		UNHANDLED(IS_ERR_VALUE(ret));
-		NEVER(populate);
-	}
-
-	return ret;
-}
-
 void pt_pre_execve(void)
 {
 	if (!pt_enabled())
@@ -2143,7 +1595,7 @@ static inline void pt_detach(void)
 
 void pt_on_execve(void)
 {
-	unsigned long len, ret, populate;
+	unsigned long len;
 	struct vm_area_struct *vma;
 
 	if (pt_enabled()) {
@@ -2171,16 +1623,9 @@ void pt_on_execve(void)
 			continue;
 		NEVER(!(vma->vm_flags & VM_READ));
 		len = vma->vm_end - vma->vm_start;
-		pt_log_xpage(current, vma->vm_start, 0, len);
-		pt_mirror_page(vma->vm_start, len);
-	}
 
-	/* map the policy matrix */
-	ret = do_mmap_pgoff(NULL, POLICY_MATRIX, POLICY_SIZE, PROT_READ
-			| PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
-			0, &populate);
-	UNHANDLED(IS_ERR_VALUE(ret));
-	NEVER(populate);
+		pt_log_xpage(current, vma->vm_start, 0, len);
+	}
 
 	pt_attach(current);
 }
@@ -2197,9 +1642,7 @@ void pt_on_exit(void)
 	// Exiting the program - dump the rest of the trace
 	// Do this AFTER we detach, because the pt_detach function will wait
 	// for the rest of the buffers to be written to disk before we print.
-	if (_PT_TRACE_PROC_END) {
-		ring_buffer->print_buffer(0); // Print all		
-	}
+	ring_buffer->print_buffer();
 }
 
 int pt_on_interrupt(struct pt_regs *regs)
@@ -2283,7 +1726,6 @@ void pt_on_mmap(struct file *file, unsigned long addr, unsigned long len,
 		- (pgoff << PAGE_SHIFT): len;
 	actual_len = len > actual_len? actual_len: len;
 	pt_log_xpage(current, addr, actual_len, PAGE_ALIGN(len));
-	pt_mirror_page(addr, len);
 }
 
 void pt_on_syscall(struct pt_regs *regs)
@@ -2355,16 +1797,15 @@ static int __init pt_init(void)
 
 	memset(pt_monitor, 0, PATH_MAX);
 
-	/* create pt_policy file */
-	ret = pt_policy_setup();
+	/* create pt_trace_address file */
+	ret = pt_trace_address_setup();
 	if (ret < 0)
 		goto destroy_monitor;
-		//goto destroy_mode;
 
 	/* create pt_trace_syscall file */
 	ret = pt_trace_syscall_setup();
 	if (ret < 0)
-		goto destroy_policy;
+		goto destroy_trace_address;
 
 	/* create pt_trace_fwd_edge file */
 	ret = pt_trace_fwd_edge_setup();
@@ -2384,8 +1825,8 @@ destroy_trace_fwd_edge:
 	pt_trace_fwd_edge_destroy();
 destroy_trace_syscall:
 	pt_trace_syscall_destroy();
-destroy_policy:
-	pt_policy_destroy();
+destroy_trace_address:
+	pt_trace_address_destroy();
 destroy_monitor:
 	pt_monitor_destroy();
 destroy_wq:
@@ -2408,9 +1849,12 @@ static void __exit pt_exit(void)
 	pt_trace_shadow_stack_destroy();
 	pt_trace_fwd_edge_destroy();
 	pt_trace_syscall_destroy();
-	pt_policy_destroy();
+	pt_trace_address_destroy();
 	pt_monitor_destroy();
 	pt_wq_destroy();
+	kmem_cache_destroy(pt_ring_item_data_cache);
+	kmem_cache_destroy(pt_ring_item_cache);
+	kmem_cache_destroy(pt_ring_buffer_cache);
 	kmem_cache_destroy(pt_trace_cache);
 	kmem_cache_destroy(pt_block_cache);
 	kmem_cache_destroy(pt_buffer_cache);
