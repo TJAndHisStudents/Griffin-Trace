@@ -1,0 +1,51 @@
+#!/bin/bash
+
+# Forward Edge Tests
+
+# Compile the program we need
+gcc attack-return.c -o attack-return.out
+
+# Clear the dmesg output without reading
+dmesg -C
+
+# Run the test without any settings
+echo -n attack-return.out > /sys/kernel/debug/pt_monitor
+./attack-return.out
+echo -e "\x00" | tee /sys/kernel/debug/pt_monitor
+
+# Sleep - Griffin runs on separate threads and lags behind the program
+# EXCEPT for when system calls are made and require immediate attention
+# In which case Griffin will catch up to the system call
+sleep 3
+
+# Run the test with system call capture
+echo -n attack-return.out > /sys/kernel/debug/pt_monitor
+echo -n 2 > /sys/kernel/debug/pt_trace_syscall
+./attack-return.out
+cp /var/log/pt.log ./attack-return-syscall.log
+echo -e "\x00" | tee /sys/kernel/debug/pt_monitor
+
+# Catch up and wait
+sleep 3
+
+# Run the test with shadow stack capture
+echo -n attack-return.out > /sys/kernel/debug/pt_monitor
+echo -n 3 > /sys/kernel/debug/pt_trace_shadow_stack
+./attack-return.out
+cp /var/log/pt.log ./attack-return-shadow-stack.log
+echo -e "\x00" | tee /sys/kernel/debug/pt_monitor
+
+# Catch up and wait
+sleep 3
+
+# Run the test with forward edge capture
+echo -n attack-return.out > /sys/kernel/debug/pt_monitor
+echo -n 3 > /sys/kernel/debug/pt_trace_fwd_edge
+./attack-return.out
+echo -e "\x00" | tee /sys/kernel/debug/pt_monitor
+
+# Catch up and wait
+sleep 3
+
+# Print out the full dmesg result
+dmesg

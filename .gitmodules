@@ -1,0 +1,3 @@
+[submodule "griffin-tests/griffin-trace-annotator"]
+	path = griffin-tests/griffin-trace-annotator
+	url = https://github.com/TJAndHisStudents/griffin-trace-annotator.git
