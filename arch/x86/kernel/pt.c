@@ -376,6 +376,26 @@ destroy_ring_buffer_cache:
 	return -1;
 }
 
+int reset_ring_buffer(void) {
+	// If the head have a previous ring buffer item, start there.
+	if (ring_buffer->head->prev != NULL) {
+		ring_buffer->curr = ring_buffer->head->prev;
+	}
+	// Otherwise, we're going to start at the current rb item, since it's the last
+
+	// Iterate over all ring items and set the data lengths to 0
+	while (ring_buffer->curr->prev != NULL && ring_buffer->curr->prev->data_length > 0) {
+		// Set the data length to 0 (won't print out)
+		ring_buffer->curr->data_length = 0;
+
+		// Move back one
+		ring_buffer->curr = ring_buffer->curr->prev;
+	}
+	// Now we should be back at the head
+
+	return 0;
+}
+
 /** End Ring Buffer logic **/
 
 
@@ -392,7 +412,7 @@ static struct dentry *pt_trace_shadow_stack_dentry;
 static bool _PT_TRACE_SYSCALL      = false;
 static bool _PT_TRACE_FWD_EDGE     = false;
 static bool _PT_TRACE_SHADOW_STACK = false;
-static bool _PT_TRACE_PROC_END     = false;
+static bool _PT_TRACE_PROC_END     = true;
 
 // Number of buffers before and after. No larger than {ring buffer max}/2.
 static int _PT_TRACE_SYSCALL_WIDTH = 1;
@@ -2190,6 +2210,9 @@ void pt_on_exit(void)
 	if (_PT_TRACE_PROC_END) {
 		ring_buffer->print_buffer(0); // Print all		
 	}
+
+	// Now clear all of the buffers
+	reset_ring_buffer();
 }
 
 int pt_on_interrupt(struct pt_regs *regs)
