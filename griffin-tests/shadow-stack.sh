@@ -23,6 +23,7 @@ echo -n attack-return.out > /sys/kernel/debug/pt_monitor
 echo -n 2 > /sys/kernel/debug/pt_trace_syscall
 ./attack-return.out
 cp /var/log/pt.log ./attack-return-syscall.log
+cp /var/log/pt.violation.log ./attack-return-syscall.violation.log
 echo -e "\x00" | tee /sys/kernel/debug/pt_monitor
 
 # Catch up and wait
@@ -33,6 +34,7 @@ echo -n attack-return.out > /sys/kernel/debug/pt_monitor
 echo -n 3 > /sys/kernel/debug/pt_trace_shadow_stack
 ./attack-return.out
 cp /var/log/pt.log ./attack-return-shadow-stack.log
+cp /var/log/pt.violation.log ./attack-return-shadow-stack.violation.log
 echo -e "\x00" | tee /sys/kernel/debug/pt_monitor
 
 # Catch up and wait
@@ -46,6 +48,18 @@ echo -e "\x00" | tee /sys/kernel/debug/pt_monitor
 
 # Catch up and wait
 sleep 3
+
+# Run the test with process end capture
+echo -n attack-return.out > /sys/kernel/debug/pt_monitor
+echo -n 6 > /sys/kernel/debug/pt_trace_proc_end
+./attack-return.out
+cp /var/log/pt.log ./attack-return-proc-end.log
+cp /var/log/pt.violation.log ./attack-return-proc-end.violation.log
+echo -e "\x00" | tee /sys/kernel/debug/pt_monitor
+
+# Catch up and wait
+sleep 3
+
 
 # Print out the full dmesg result
 dmesg

@@ -112,10 +112,10 @@ retry:
 		block->fallthrough_addr = inst.addr + inst.size;
 		if (block->kind == PT_BLOCK_DIRECT_CALL) {
 			block->target_addr = block->fallthrough_addr + inst.imm.sdword;
-			pt_on_direct_call(block->target_addr);
+			//pt_on_direct_call(block->target_addr);
 			pt_plt_addr(block->target_addr, addr, arg);
 		} else {
-			pt_on_indirect_call(block->fallthrough_addr);
+			//pt_on_indirect_call(block->fallthrough_addr);
 			pt_plt_addr(block->fallthrough_addr, addr, arg);
 		}
 		break;
@@ -479,7 +479,6 @@ do { \
 			retc[retc_index] = curr_block; \
 			retc_index = (retc_index + 1) % RETC_STACK_SIZE; \
 		} \
-		pt_on_block(pt_get_target_addr(curr_block), arg); \
 		curr_block = pt_get_target_block(curr_block, arg); \
 	} \
 } while(0)
@@ -504,15 +503,15 @@ do { \
 					if (pt_block_is_ret(curr_block)) {
 						retc_index = (retc_index + RETC_STACK_SIZE - 1) % RETC_STACK_SIZE;
 						pt_on_ret(pt_get_fallthrough_addr(retc[retc_index]), arg);
-						pt_on_block(pt_get_fallthrough_addr(retc[retc_index]), arg);
-						pt_on_return(pt_get_fallthrough_addr(retc[retc_index]));
+						//pt_on_block(pt_get_fallthrough_addr(retc[retc_index]), arg);
+						//pt_on_return(pt_get_fallthrough_addr(retc[retc_index]));
 						curr_block = pt_get_fallthrough_block(retc[retc_index], arg);
 					} else {
-						pt_on_block(pt_get_target_addr(curr_block), arg);
+						//pt_on_block(pt_get_target_addr(curr_block), arg);
 						curr_block = pt_get_target_block(curr_block, arg);
 					}
 				} else {
-					pt_on_block(pt_get_fallthrough_addr(curr_block), arg);
+					//pt_on_block(pt_get_fallthrough_addr(curr_block), arg);
 					curr_block = pt_get_fallthrough_block(curr_block, arg);
 				}
 			} while (bit_selector != 2);
@@ -530,18 +529,18 @@ do { \
 					retc_index = (retc_index + 1) % RETC_STACK_SIZE;
 				} else if (pt_block_is_ret(curr_block)) {
 					pt_on_ret(curr_addr, arg);
-					pt_on_return(curr_addr);
+					//pt_on_return(curr_addr);
 				}
 			}
 
-			pt_on_block(curr_addr, arg);
+			//pt_on_block(curr_addr, arg);
 			curr_block = pt_get_block(curr_addr, arg);
 			break;
 
 		case PT_PACKET_TIPPGE:
 			curr_addr = pt_get_and_update_ip(packet, packet_len, &last_ip);
 			curr_block = pt_get_block(curr_addr, arg);
-			pt_on_block(curr_addr, arg);
+			//pt_on_block(curr_addr, arg);
 			break;
 
 		case PT_PACKET_TIPPGD:
@@ -609,8 +608,6 @@ do { \
 		default:
 			break;
 		}
-
-		printf("  packet length: %lu\n", packet_len);
 
 		bytes_remained -= packet_len;
 		packet += packet_len;

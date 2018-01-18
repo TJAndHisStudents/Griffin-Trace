@@ -111,8 +111,12 @@ retry:
 	case FC_CALL:
 		block->kind = inst.ops[0].type == O_PC? PT_BLOCK_DIRECT_CALL: PT_BLOCK_INDIRECT_CALL;
 		block->fallthrough_addr = inst.addr + inst.size;
-		if (block->kind == PT_BLOCK_DIRECT_CALL)
+		if (block->kind == PT_BLOCK_DIRECT_CALL) {
 			block->target_addr = block->fallthrough_addr + inst.imm.sdword;
+			pt_plt_addr(block->target_addr, addr, arg);
+		} else {
+			pt_plt_addr(block->fallthrough_addr, addr, arg);
+		}
 		break;
 	case FC_RET:
 		block->kind = PT_BLOCK_RET;
@@ -121,6 +125,7 @@ retry:
 	case FC_SYS:
 		block->kind = PT_BLOCK_SYSCALL;
 		block->fallthrough_addr = inst.addr + inst.size;
+		pt_on_syscall(block->fallthrough_addr);
 		break;
 	case FC_UNC_BRANCH:
 		block->kind = inst.ops[0].type == O_PC? PT_BLOCK_DIRECT_JMP: PT_BLOCK_INDIRECT_JMP;

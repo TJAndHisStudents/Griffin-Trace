@@ -145,6 +145,15 @@ static inline void pt_on_ret(unsigned long addr, pt_recover_arg pid)
 	}
 }
 
+unsigned long plt_start_addr;
+unsigned long plt_end_addr;
+
+#define pt_plt_addr(next_addr, ip, pid) do { \
+	if (next_addr >= plt_start_addr && next_addr <= plt_end_addr) { \
+		printf("  trampoline: %lx\n", ip); \
+	} \
+} while (0)
+
 static inline void pt_on_xbegin(pt_recover_arg pid)
 {
 	if (!stacks[pid].xbegin) {
@@ -185,6 +194,11 @@ static inline void pt_on_xabort(pt_recover_arg pid)
 
 #define pt_on_mode(mode_payload, pid)
 
+static inline void pt_on_syscall(unsigned long addr)
+{
+	printf("  syscall: %lx\n", addr);
+}
+
 static inline void pt_on_block(unsigned long addr, pt_recover_arg pid)
 {
 	printf("  block: %lx\n", addr);
@@ -212,10 +226,19 @@ int main(int argc, char *argv[])
 	struct pt_event *sp;
 	int i;
 
-	ABORT(argc < 2, "./pt log-file");
+	ABORT(argc < 2, "./pt log-file [plt-start-address] [plt-end-address]");
 
 	log = fopen(argv[1], "r");
 	ABORT(!log, "open %s failed", argv[1]);
+
+	// If we have additional arguments, get the PLT range to trigger the blame investigation
+	if (argc == 4) {
+		plt_start_addr = strtol(argv[2], NULL, 16);
+		plt_end_addr = strtol(argv[3], NULL, 16);
+	} else {
+		plt_start_addr = 0;
+		plt_end_addr = 0;
+	}
 
 	len = fread(&lhdr, 1, sizeof(lhdr), log);
 	ABORT(len < sizeof(lhdr), "corrupted log");

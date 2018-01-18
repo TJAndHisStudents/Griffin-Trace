@@ -48,7 +48,7 @@
 #define TOPA_ENTRY_SIZE_32M 13
 #define TOPA_ENTRY_SIZE_64M 14
 #define TOPA_ENTRY_SIZE_128M 15
-#define TOPA_ENTRY_SIZE_CHOICE TOPA_ENTRY_SIZE_2M
+#define TOPA_ENTRY_SIZE_CHOICE TOPA_ENTRY_SIZE_64K
 #define TOPA_BUFFER_SIZE (1 << (12 + TOPA_ENTRY_SIZE_CHOICE))
 
 #define pt_resume() wrmsrl(MSR_IA32_RTIT_CTL, \
@@ -211,6 +211,32 @@ static DEFINE_MUTEX(pt_logfile_mtx);
 
 
 
+/** Start Violation Log **/
+
+static struct file *pt_violation_logfile = NULL;
+static loff_t pt_violation_logfile_off = 0;
+static DEFINE_MUTEX(pt_violation_logfile_mtx);
+
+#define pt_close_violation_logfile() do { \
+	if (pt_violation_logfile) { \
+		filp_close(pt_violation_logfile, NULL); \
+		pt_violation_logfile = NULL; \
+		pt_violation_logfile_off = 0; \
+	} \
+} while (0)
+
+#define pt_violation_log(buf, count) do { \
+	ssize_t s; \
+	NEVER(!pt_violation_logfile); \
+	s = kernel_write(pt_violation_logfile, (char *) buf, count, pt_violation_logfile_off); \
+	UNHANDLED(s < 0); \
+	pt_violation_logfile_off += s; \
+} while (0)
+
+/** End Violation Log **/
+
+
+
 /** Ring Buffer storage of packets **/
 
 // Need a circular linked list (a ring buffer) to manage all of the last N packets
@@ -295,7 +321,7 @@ void print_buffer(unsigned int max_number_of_buffers) {
 	pt_print("Current buffer is #%d, size (%zd)\n", ring_buffer->curr->index, ring_buffer->curr->data_length);
 
 	// If we don't have a full ring buffer, start at the head
-	if (ring_buffer->curr->next == NULL) {
+	if (ring_buffer->curr->next == NULL || ring_buffer->curr->data_length <= 0) {
 		ring_buffer->curr = ring_buffer->head;
 	}
 
@@ -406,18 +432,20 @@ int reset_ring_buffer(void) {
 static struct dentry *pt_trace_syscall_dentry;
 static struct dentry *pt_trace_fwd_edge_dentry;
 static struct dentry *pt_trace_shadow_stack_dentry;
+static struct dentry *pt_trace_proc_end_dentry;
 
 // Turn on / off the various ways to print traces
 //static bool _PT_TRACE_ADDR_RANGE = false;
 static bool _PT_TRACE_SYSCALL      = false;
 static bool _PT_TRACE_FWD_EDGE     = false;
 static bool _PT_TRACE_SHADOW_STACK = false;
-static bool _PT_TRACE_PROC_END     = true;
+static bool _PT_TRACE_PROC_END     = false;
 
 // Number of buffers before and after. No larger than {ring buffer max}/2.
 static int _PT_TRACE_SYSCALL_WIDTH = 1;
 static int _PT_TRACE_FWD_EDGE_WIDTH = 1;
 static int _PT_TRACE_SHADOW_STACK_WIDTH = 1;
+static int _PT_TRACE_PROC_END_WIDTH = 1;
 
 // For dumping traces within address ranges
 // If these are ordered, we can search through them quickly
@@ -528,14 +556,12 @@ pt_trace_syscall_write(struct file *filp, const char __user *buf,
 	// Pull the number
 	res = kstrtoint((const char *)&mode,10,&_PT_TRACE_SYSCALL_WIDTH);
 
-	pt_print("tracing system calls: %s -> %d\n", (char *)&mode, _PT_TRACE_SYSCALL_WIDTH);
-
 	// Validate and set
 	if (_PT_TRACE_SYSCALL_WIDTH < 1 || (_PT_TRACE_SYSCALL_WIDTH*2 > RING_BUFFER_COUNT)) {
 		pt_print("invalid Griffin syscall buffer width - must be between 1 and 3\n");
 		_PT_TRACE_SYSCALL = false;
 	} else {
-		pt_print("tracing system calls: %s -> %d\n", (char *)&mode, _PT_TRACE_SYSCALL_WIDTH);
+		pt_print("tracing system calls, width of %d\n", _PT_TRACE_SYSCALL_WIDTH);
 		_PT_TRACE_SYSCALL = true;
 	}
 
@@ -591,7 +617,7 @@ pt_trace_fwd_edge_write(struct file *filp, const char __user *buf,
 		pt_print("invalid Griffin fwd edge buffer size - must be between 1 and %d\n", RING_BUFFER_COUNT);
 		_PT_TRACE_FWD_EDGE = false;
 	} else {
-		pt_print("tracing fwd edge CFI violations: %s -> %d\n", (char *)&mode, _PT_TRACE_FWD_EDGE_WIDTH);
+		pt_print("tracing fwd edge CFI violations, width of %d\n", _PT_TRACE_FWD_EDGE_WIDTH);
 		_PT_TRACE_FWD_EDGE = true;
 	}
 
@@ -647,7 +673,7 @@ pt_trace_shadow_stack_write(struct file *filp, const char __user *buf,
 		pt_print("invalid Griffin shadow stack buffer size - must be between 1 and %d\n", RING_BUFFER_COUNT);
 		_PT_TRACE_SHADOW_STACK = false;
 	} else {
-		pt_print("tracing shadow stack CFI violations: %s -> %d\n", (char *)&mode, _PT_TRACE_SHADOW_STACK_WIDTH);
+		pt_print("tracing shadow stack CFI violations, width of %d\n", _PT_TRACE_SHADOW_STACK_WIDTH);
 		_PT_TRACE_SHADOW_STACK = true;
 	}
 
@@ -675,6 +701,63 @@ static void pt_trace_shadow_stack_destroy(void)
 	if (pt_trace_shadow_stack_dentry)
 		debugfs_remove(pt_trace_shadow_stack_dentry);
 }
+
+static ssize_t
+pt_trace_proc_end_write(struct file *filp, const char __user *buf,
+		size_t count, loff_t *ppos)
+{
+	char mode[5];
+	int res = 0;
+
+	// Clear the mode
+	memset(mode, 0, 5);
+
+	if (*ppos != 0)
+		return -EINVAL;
+	if (count != 1)
+		return -EINVAL;
+	if (atomic64_read(&pt_flying_tasks))
+		return -EBUSY;
+	if (copy_from_user(mode, buf, count))
+		return -EINVAL;
+
+	// Pull the number
+	res = kstrtoint((const char *)&mode,10,&_PT_TRACE_PROC_END_WIDTH);
+
+	// Validate and set
+	if (_PT_TRACE_PROC_END_WIDTH < 1 || (_PT_TRACE_PROC_END_WIDTH > RING_BUFFER_COUNT)) {
+		pt_print("invalid Griffin process end buffer size - must be between 1 and %d\n", RING_BUFFER_COUNT);
+		_PT_TRACE_PROC_END = false;
+	} else {
+		pt_print("producing traces at end of process, width of %d\n", _PT_TRACE_PROC_END_WIDTH);
+		_PT_TRACE_PROC_END = true;
+	}
+
+	return 1;
+}
+
+static const struct file_operations pt_trace_proc_end_fops = {
+	.write = pt_trace_proc_end_write,
+};
+
+static int pt_trace_proc_end_setup(void)
+{
+	pt_trace_proc_end_dentry = debugfs_create_file("pt_trace_proc_end",
+			0600, NULL, NULL, &pt_trace_proc_end_fops);
+	if (!pt_trace_proc_end_dentry) {
+		pt_print("unable to create pt_trace_proc_end\n");
+		return -ENOMEM;
+	}
+
+	return 0;
+}
+
+static void pt_trace_proc_end_destroy(void)
+{
+	if (pt_trace_proc_end_dentry)
+		debugfs_remove(pt_trace_proc_end_dentry);
+}
+
 
 /** End API Methods **/
 
@@ -902,6 +985,10 @@ static ssize_t
 pt_monitor_write(struct file *filp, const char __user *buf,
 		size_t count, loff_t *ppos)
 {
+	int violation_log_string_max_size = 50;
+	char violation_log_string[violation_log_string_max_size];
+	int violation_log_size = 0;
+
 	if (count >= PATH_MAX)
 		return -ENOMEM;
 	if (*ppos != 0)
@@ -921,16 +1008,27 @@ pt_monitor_write(struct file *filp, const char __user *buf,
 	pt_log_header();
 	workqueue_set_max_active(pt_wq, 1);
 
+	// Prepare the violation log
+	pt_close_violation_logfile();
+	pt_violation_logfile = filp_open("/var/log/pt.violation.log", O_WRONLY | O_TRUNC
+			| O_CREAT | O_LARGEFILE, 0644);
+	if (IS_ERR_OR_NULL(pt_violation_logfile))
+		return PTR_ERR(pt_violation_logfile);
+
+	// Print the header
+	memset(violation_log_string, 0, violation_log_string_max_size);
+	violation_log_size = sprintf(violation_log_string, "%s\n", pt_monitor);
+	pt_violation_log(violation_log_string, violation_log_size);
+
 	// Reset the PT watch triggers
 	_PT_TRACE_FWD_EDGE = false;
 	_PT_TRACE_SHADOW_STACK = false;
 	_PT_TRACE_SYSCALL = false;
+	_PT_TRACE_PROC_END = false;
 	pt_trace_fwd_edge_trigger = false;
 	pt_trace_shadow_stack_trigger = false;
 	pt_trace_syscall_trigger = false;
 	pt_trace_syscall_trigger_rb_index = -1;
-
-	// TODO: Clear out the PT Buffers here
 
 	pt_print("offline: %s registered\n", pt_monitor);
 
@@ -1573,6 +1671,9 @@ static inline void pt_process_buffer(struct pt_buffer *buf)
 {
 	int i;
 	pt_event event;
+	int violation_log_string_max_size = 50;
+	char violation_log_string[violation_log_string_max_size];
+	int violation_log_size = 0;
 	struct topa *topa = buf->topa;
 
 	/* global shadow stack check! */
@@ -1586,6 +1687,11 @@ static inline void pt_process_buffer(struct pt_buffer *buf)
 				// Notify
 				pt_fail_topa(topa, "unmatched return: %llx",
 						(u64) -topa->stack[0]);
+
+				// Generate the violation log information
+				memset(violation_log_string, 0, violation_log_string_max_size);
+				violation_log_size = sprintf(violation_log_string, "1 %llx\n", (u64) -topa->stack[0]);
+				pt_violation_log(violation_log_string, violation_log_size);
 
 				if (_PT_TRACE_SHADOW_STACK) {
 					pt_trace_shadow_stack_trigger = true;
@@ -1697,6 +1803,9 @@ pt_recover(char *buffer, u32 size, pt_event stack[], int *index)
 	int si = *index;
 	int xbegin = -1;
 	unsigned short src_index = POLICY_RSVD;
+	int violation_log_string_max_size = 50;
+	char violation_log_string[violation_log_string_max_size];
+	int violation_log_size = 0;
 
 #define PUSH_CALL(addr) pt_push_call(stack, &si, addr)
 #define PUSH_RET(addr) \
@@ -1782,6 +1891,11 @@ do { \
 				// Notify
 				pt_print("forward-edge violation: %u -> %u (%llx)\n",
 						src_index, curr_block->dst_index, curr_addr);
+
+				// Generate the violation log information
+				memset(violation_log_string, 0, violation_log_string_max_size);
+				violation_log_size = sprintf(violation_log_string, "0 %llx\n", curr_addr);
+				pt_violation_log(violation_log_string, violation_log_size);
 
 				if (_PT_TRACE_FWD_EDGE) {
 					pt_trace_fwd_edge_trigger = true;
@@ -2208,7 +2322,7 @@ void pt_on_exit(void)
 	// Do this AFTER we detach, because the pt_detach function will wait
 	// for the rest of the buffers to be written to disk before we print.
 	if (_PT_TRACE_PROC_END) {
-		ring_buffer->print_buffer(0); // Print all		
+		ring_buffer->print_buffer(_PT_TRACE_PROC_END_WIDTH);
 	}
 
 	// Now clear all of the buffers
@@ -2389,10 +2503,17 @@ static int __init pt_init(void)
 	if (ret < 0)
 		goto destroy_trace_fwd_edge;
 
+	/* create pt_trace_proc_end file */
+	ret = pt_trace_proc_end_setup();
+	if (ret < 0)
+		goto destroy_trace_shadow_stack;
+
 	pt_print("initialized (distorm version: %x)\n", distorm_version());
 
 	return ret;
 
+destroy_trace_shadow_stack:
+	pt_trace_shadow_stack_destroy();
 destroy_trace_fwd_edge:
 	pt_trace_fwd_edge_destroy();
 destroy_trace_syscall:
@@ -2418,6 +2539,7 @@ static void __exit pt_exit(void)
 	NEVER(pt_enabled());
 
 	pt_close_logfile();
+	pt_trace_proc_end_destroy();
 	pt_trace_shadow_stack_destroy();
 	pt_trace_fwd_edge_destroy();
 	pt_trace_syscall_destroy();
