@@ -428,57 +428,46 @@ int reset_ring_buffer(void) {
 /** API Methods **/
 
 // Flags
-//static struct dentry *pt_trace_address_dentry;
+static struct dentry *pt_trace_address_dentry;
 static struct dentry *pt_trace_syscall_dentry;
 static struct dentry *pt_trace_fwd_edge_dentry;
 static struct dentry *pt_trace_shadow_stack_dentry;
 static struct dentry *pt_trace_proc_end_dentry;
 
 // Turn on / off the various ways to print traces
-//static bool _PT_TRACE_ADDR_RANGE = false;
+static bool _PT_TRACE_ADDR         = false;
 static bool _PT_TRACE_SYSCALL      = false;
 static bool _PT_TRACE_FWD_EDGE     = false;
 static bool _PT_TRACE_SHADOW_STACK = false;
 static bool _PT_TRACE_PROC_END     = false;
 
 // Number of buffers before and after. No larger than {ring buffer max}/2.
+static int _PT_TRACE_ADDR_WIDTH = 1;
 static int _PT_TRACE_SYSCALL_WIDTH = 1;
 static int _PT_TRACE_FWD_EDGE_WIDTH = 1;
 static int _PT_TRACE_SHADOW_STACK_WIDTH = 1;
 static int _PT_TRACE_PROC_END_WIDTH = 1;
 
-// For dumping traces within address ranges
-// If these are ordered, we can search through them quickly
-/*
-static int pt_range_address_count       = 1;
-static u64 pt_range_start_addresses[10] = {0x400c18,0,0,0,0,0,0,0,0,0};
-static u64 pt_range_end_addresses[10]   = {0x400960,0,0,0,0,0,0,0,0,0};
-static bool pt_range_open[10]           = {false,false,false,false,false,false,false,false,false,false};
-*/
+// For dumping traces on address triggers
+static int pt_address_count       = 3;
+static u64 pt_addresses[10] = {0x400c18,0x400430,0x400400,0,0,0,0,0,0,0};
+static char pt_addresses_string[PATH_MAX];
 
-// Currently O(num addrs) timing - would like to reduce since this is called a LOT
-/*
-#define pt_trace_on_addr_range(last_addr, curr_addr) do { \
-	if (_PT_TRACE_ADDR_RANGE) { \
-		int pt_range_idx = 0; \
-		for (pt_range_idx = 0; pt_range_idx < pt_range_address_count; pt_range_idx++) { \
-			u64 pt_range_start_addr = pt_range_start_addresses[pt_range_idx]; \
-			u64 pt_range_end_addr   = pt_range_end_addresses[pt_range_idx]; \
-			if (!pt_range_open[pt_range_idx] && curr_addr <= pt_range_start_addr) { \
-				pt_range_open[pt_range_idx] = true; \
-				pt_print("  Starting Range: %llx to %llx compared to %llx\n", last_addr, curr_addr, pt_range_start_addr); \
-			} \
-			else if (pt_range_open[pt_range_idx] && curr_addr <= pt_range_end_addr) { \
-				pt_range_open[pt_range_idx] = false; \
-				_PT_TRACE_ADDR_RANGE = false; \
-				pt_print("  Finished Range: %llx to %llx compared to %llx\n", last_addr, curr_addr, pt_range_end_addr); \
+#define pt_trace_on_addr(curr_addr) do { \
+	if (_PT_TRACE_ADDR) { \
+		int pt_addr_idx = 0; \
+		for (pt_addr_idx = 0; pt_addr_idx < pt_address_count; pt_addr_idx++) { \
+			u64 pt_start_addr = pt_addresses[pt_addr_idx]; \
+			if (curr_addr == pt_start_addr) { \
+				pt_print("  Address Triggered: %lx compared to %llx\n", curr_addr, pt_start_addr); \
+				pt_trace_addr_trigger = true; \
 			} \
 		} \
 	} \
 } while (0)
-*/
 
 // Keep track of when we need to dump a trace
+static bool pt_trace_addr_trigger = false;
 static bool pt_trace_fwd_edge_trigger = false;
 static bool pt_trace_shadow_stack_trigger = false;
 static bool pt_trace_syscall_trigger = false;
@@ -498,23 +487,62 @@ static int pt_trace_syscall_trigger_rb_index = -1;
 
 // Files - used to trigger the APIs
 
-/*
+static ssize_t
+pt_trace_address_read(struct file *file, char __user *buf,
+		size_t count, loff_t *ppos)
+{
+	return simple_read_from_buffer(buf, count, ppos, pt_addresses_string,
+			strlen(pt_addresses_string));
+}
+
 static ssize_t
 pt_trace_address_write(struct file *filp, const char __user *buf,
 		size_t count, loff_t *ppos)
 {
-	// In progress
+	int addresses_max_length = 500;
+	char addresses[addresses_max_length], address[addresses_max_length];
+	char * addresses_location = &(addresses[0]);
+	char * address_location = &(address[0]);
+	int iter = 0;
+
+	if (count >= addresses_max_length)
+		return -ENOMEM;
+	if (*ppos != 0)
+		return -EINVAL;
+	if (atomic64_read(&pt_flying_tasks))
+		return -EBUSY;
+
+	memset(addresses, 0, addresses_max_length);
+	memset(address, 0, addresses_max_length);
+	if (copy_from_user(addresses, buf, count))
+		return -EINVAL;
+
+	// Iterate over all items in the list
+	while((address_location = strsep(&addresses_location, " ")) != NULL && iter < 10) {
+		//pt_addresses[iter++] = strtoull(address, sizeof(address), 16);
+		pt_print("%s %d\n", address, sizeof(address));
+		iter++;
+	}
+
+	// Validate and set
+	if (iter <= 0) {
+		_PT_TRACE_ADDR = false;
+	} else {
+		pt_address_count = iter;
+		pt_print("tracing addresses, %d addresses, width of %d\n", pt_address_count, _PT_TRACE_ADDR_WIDTH);
+		_PT_TRACE_ADDR = true;
+	}
+
+	return 1;
 }
 
 static const struct file_operations pt_trace_address_fops = {
 	.write = pt_trace_address_write,
+	.read = pt_trace_address_read,
 };
-*/
 
 static int pt_trace_address_setup(void)
 {
-	return 0;
-/*
 	pt_trace_address_dentry = debugfs_create_file("pt_trace_addresses",
 			0600, NULL, NULL, &pt_trace_address_fops);
 	if (!pt_trace_address_dentry) {
@@ -523,15 +551,12 @@ static int pt_trace_address_setup(void)
 	}
 
 	return 0;
-*/
 }
 
 static void pt_trace_address_destroy(void)
 {
-/*
 	if (pt_trace_address_dentry)
 		debugfs_remove(pt_trace_address_dentry);
-*/
 }
 
 static ssize_t
@@ -1021,6 +1046,8 @@ pt_monitor_write(struct file *filp, const char __user *buf,
 	pt_violation_log(violation_log_string, violation_log_size);
 
 	// Reset the PT watch triggers
+	//_PT_TRACE_ADDR = false;
+	_PT_TRACE_ADDR = true;
 	_PT_TRACE_FWD_EDGE = false;
 	_PT_TRACE_SHADOW_STACK = false;
 	_PT_TRACE_SYSCALL = false;
@@ -1541,29 +1568,39 @@ retry:
 	case FC_CALL:
 		block->kind = inst.ops[0].type == O_PC? PT_BLOCK_DIRECT_CALL: PT_BLOCK_INDIRECT_CALL;
 		block->fallthrough_addr = inst.addr + inst.size;
-		if (block->kind == PT_BLOCK_DIRECT_CALL)
+		pt_trace_on_addr(block->fallthrough_addr);
+		if (block->kind == PT_BLOCK_DIRECT_CALL) {
 			block->target_addr = block->fallthrough_addr + inst.imm.sdword;
+			pt_trace_on_addr(block->target_addr);
+		}
 		break;
 	case FC_RET:
 		block->kind = PT_BLOCK_RET;
 		block->fallthrough_addr = inst.addr + inst.size;
+		pt_trace_on_addr(block->fallthrough_addr);
 		break;
 	case FC_SYS:
 		block->kind = PT_BLOCK_SYSCALL;
 		block->fallthrough_addr = inst.addr + inst.size;
+		pt_trace_on_addr(block->fallthrough_addr);
 		break;
 	case FC_UNC_BRANCH:
 		block->kind = inst.ops[0].type == O_PC? PT_BLOCK_DIRECT_JMP: PT_BLOCK_INDIRECT_JMP;
 		block->fallthrough_addr = inst.addr + inst.size;
-		if (block->kind == PT_BLOCK_DIRECT_JMP)
+		pt_trace_on_addr(block->fallthrough_addr);
+		if (block->kind == PT_BLOCK_DIRECT_JMP) {
 			block->target_addr = block->fallthrough_addr +
 				(inst.ops[0].size == 32? inst.imm.sdword: inst.imm.sbyte);
+			pt_trace_on_addr(block->target_addr);
+		}
 		break;
 	case FC_CND_BRANCH:
 		block->kind = PT_BLOCK_COND_JMP;
 		block->fallthrough_addr = inst.addr + inst.size;
+		pt_trace_on_addr(block->fallthrough_addr);
 		block->target_addr = block->fallthrough_addr +
 			(inst.ops[0].size == 32? inst.imm.sdword: inst.imm.sbyte);
+		pt_trace_on_addr(block->target_addr);
 		break;
 	case FC_INT:
 		block->kind = PT_BLOCK_TRAP;
@@ -2046,6 +2083,17 @@ static void pt_work(struct work_struct *work)
 		// Unset the trigger
 		pt_trace_shadow_stack_trigger = false;
 	}
+
+	// Write any existing ring items - address trigger
+	if (pt_trace_addr_trigger)
+	{
+		// Write the existing ring buffers
+		pt_print("  Dumping trace from CFI address trigger.");
+		ring_buffer->print_buffer(_PT_TRACE_ADDR_WIDTH);
+
+		// Unset the trigger
+		pt_trace_addr_trigger = false;
+	}
 }
 
 static void pt_tasklet(unsigned long data)
@@ -2508,10 +2556,17 @@ static int __init pt_init(void)
 	if (ret < 0)
 		goto destroy_trace_shadow_stack;
 
+	/* create pt_trace_address file */
+	ret = pt_trace_address_setup();
+	if (ret < 0)
+		goto destroy_trace_proc_end;
+
 	pt_print("initialized (distorm version: %x)\n", distorm_version());
 
 	return ret;
 
+destroy_trace_proc_end:
+	pt_trace_proc_end_destroy();
 destroy_trace_shadow_stack:
 	pt_trace_shadow_stack_destroy();
 destroy_trace_fwd_edge:
@@ -2539,6 +2594,7 @@ static void __exit pt_exit(void)
 	NEVER(pt_enabled());
 
 	pt_close_logfile();
+	pt_trace_address_destroy();
 	pt_trace_proc_end_destroy();
 	pt_trace_shadow_stack_destroy();
 	pt_trace_fwd_edge_destroy();
