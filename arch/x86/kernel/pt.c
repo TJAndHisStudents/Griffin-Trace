@@ -450,7 +450,7 @@ static int _PT_TRACE_PROC_END_WIDTH = 1;
 
 // For dumping traces on address triggers
 static int pt_address_count       = 3;
-static u64 pt_addresses[10] = {0x400c18,0x400430,0x400400,0,0,0,0,0,0,0};
+static u64 pt_addresses[10] = {0,0,0,0,0,0,0,0,0,0};
 static char pt_addresses_string[PATH_MAX];
 
 #define pt_trace_on_addr(curr_addr) do { \
@@ -499,28 +499,28 @@ static ssize_t
 pt_trace_address_write(struct file *filp, const char __user *buf,
 		size_t count, loff_t *ppos)
 {
-	int addresses_max_length = 500;
-	char addresses[addresses_max_length], address[addresses_max_length];
-	char * addresses_location = &(addresses[0]);
-	char * address_location = &(address[0]);
+	int max_addresses = 10, address_size = 16; // 10 address triggers, 64-bit address space
+	char addresses[address_size * max_addresses];
+	char address[address_size];
+	int res = 0;
 	int iter = 0;
 
-	if (count >= addresses_max_length)
+	if (count >= (address_size * max_addresses))
 		return -ENOMEM;
 	if (*ppos != 0)
 		return -EINVAL;
 	if (atomic64_read(&pt_flying_tasks))
 		return -EBUSY;
 
-	memset(addresses, 0, addresses_max_length);
-	memset(address, 0, addresses_max_length);
+	memset(addresses, 0, address_size * max_addresses);
 	if (copy_from_user(addresses, buf, count))
 		return -EINVAL;
 
 	// Iterate over all items in the list
-	while((address_location = strsep(&addresses_location, " ")) != NULL && iter < 10) {
-		//pt_addresses[iter++] = strtoull(address, sizeof(address), 16);
-		pt_print("%s %d\n", address, sizeof(address));
+	while(iter < max_addresses && iter * address_size < count) {
+		memcpy(address, addresses + iter * address_size, address_size);
+		res = kstrtoull(address, 16, &pt_addresses[iter]);
+		pt_print("%llu %d %d\n", pt_addresses[iter], address_size, res);
 		iter++;
 	}
 
@@ -528,12 +528,12 @@ pt_trace_address_write(struct file *filp, const char __user *buf,
 	if (iter <= 0) {
 		_PT_TRACE_ADDR = false;
 	} else {
-		pt_address_count = iter;
+		pt_address_count = iter / address_size;
 		pt_print("tracing addresses, %d addresses, width of %d\n", pt_address_count, _PT_TRACE_ADDR_WIDTH);
 		_PT_TRACE_ADDR = true;
 	}
 
-	return 1;
+	return count;
 }
 
 static const struct file_operations pt_trace_address_fops = {
