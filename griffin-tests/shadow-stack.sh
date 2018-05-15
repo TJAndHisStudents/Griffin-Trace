@@ -60,6 +60,17 @@ echo -e "\x00" | tee /sys/kernel/debug/pt_monitor
 # Catch up and wait
 sleep 3
 
+# Run the test with process end capture
+echo -n attack-return.out > /sys/kernel/debug/pt_monitor
+echo -n -e "0000000000400c1800000000004004300000000000400400" | sudo tee -a /sys/kernel/debug/pt_trace_addresses
+./attack-return.out
+cp /var/log/pt.log ./attack-return-addresses.log
+cp /var/log/pt.violation.log ./attack-return-addresses.violation.log
+echo -e "\x00" | tee /sys/kernel/debug/pt_monitor
+
+# Catch up and wait
+sleep 3
+
 
 # Print out the full dmesg result
 dmesg

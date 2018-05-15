@@ -441,6 +441,9 @@ static bool _PT_TRACE_FWD_EDGE     = false;
 static bool _PT_TRACE_SHADOW_STACK = false;
 static bool _PT_TRACE_PROC_END     = false;
 
+// Defined as (_PT_TRACE_FWD_EDGE || _PT_TRACE_ADDR)
+static bool _PT_TRACE_USE_MIRROR_PAGES = false;
+
 // Number of buffers before and after. No larger than {ring buffer max}/2.
 static int _PT_TRACE_ADDR_WIDTH = 1;
 static int _PT_TRACE_SYSCALL_WIDTH = 1;
@@ -531,6 +534,8 @@ pt_trace_address_write(struct file *filp, const char __user *buf,
 		pt_address_count = iter / address_size;
 		pt_print("tracing addresses, %d addresses, width of %d\n", pt_address_count, _PT_TRACE_ADDR_WIDTH);
 		_PT_TRACE_ADDR = true;
+		_PT_TRACE_USE_MIRROR_PAGES = true;
+		pt_print("WARNING: Address tracing uses mirror pages. See documentation.\n");
 	}
 
 	return count;
@@ -644,6 +649,8 @@ pt_trace_fwd_edge_write(struct file *filp, const char __user *buf,
 	} else {
 		pt_print("tracing fwd edge CFI violations, width of %d\n", _PT_TRACE_FWD_EDGE_WIDTH);
 		_PT_TRACE_FWD_EDGE = true;
+		_PT_TRACE_USE_MIRROR_PAGES = true;
+		pt_print("WARNING: Forward Edge CFI tracing uses mirror pages. See documentation.\n");
 	}
 
 	return 1;
@@ -1046,9 +1053,9 @@ pt_monitor_write(struct file *filp, const char __user *buf,
 	pt_violation_log(violation_log_string, violation_log_size);
 
 	// Reset the PT watch triggers
-	//_PT_TRACE_ADDR = false;
-	_PT_TRACE_ADDR = true;
+	_PT_TRACE_ADDR = false;
 	_PT_TRACE_FWD_EDGE = false;
+	_PT_TRACE_USE_MIRROR_PAGES = false;
 	_PT_TRACE_SHADOW_STACK = false;
 	_PT_TRACE_SYSCALL = false;
 	_PT_TRACE_PROC_END = false;
@@ -1721,10 +1728,6 @@ static inline void pt_process_buffer(struct pt_buffer *buf)
 		} else {
 			pt_push_ret(topa->stack, &topa->index, event);
 			if (PT_EVENT_IS_RET(topa->stack[0])) {
-				// Notify
-				pt_fail_topa(topa, "unmatched return: %llx",
-						(u64) -topa->stack[0]);
-
 				// Generate the violation log information
 				memset(violation_log_string, 0, violation_log_string_max_size);
 				violation_log_size = sprintf(violation_log_string, "1 %llx\n", (u64) -topa->stack[0]);
@@ -1925,10 +1928,6 @@ do { \
 			curr_block = pt_get_block(curr_addr);
 
 			if (!POLICY_CHECK(src_index, curr_block->dst_index)) {
-				// Notify
-				pt_print("forward-edge violation: %u -> %u (%llx)\n",
-						src_index, curr_block->dst_index, curr_addr);
-
 				// Generate the violation log information
 				memset(violation_log_string, 0, violation_log_string_max_size);
 				violation_log_size = sprintf(violation_log_string, "0 %llx\n", curr_addr);
@@ -2039,7 +2038,7 @@ static void pt_work(struct work_struct *work)
 	use_mm(mm);
 	stac();
 
-	if (!buf->topa->failed)
+	if (!buf->topa->failed && _PT_TRACE_USE_MIRROR_PAGES)
 		pt_recover(buf->raw, buf->size, buf->stack, &buf->index);
 
 	kmem_cache_free(pt_trace_cache, buf->raw);
@@ -2344,15 +2343,18 @@ void pt_on_execve(void)
 		NEVER(!(vma->vm_flags & VM_READ));
 		len = vma->vm_end - vma->vm_start;
 		pt_log_xpage(current, vma->vm_start, 0, len);
-		pt_mirror_page(vma->vm_start, len);
+		if (_PT_TRACE_USE_MIRROR_PAGES)
+			pt_mirror_page(vma->vm_start, len);
 	}
 
 	/* map the policy matrix */
-	ret = do_mmap_pgoff(NULL, POLICY_MATRIX, POLICY_SIZE, PROT_READ
-			| PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
-			0, &populate);
-	UNHANDLED(IS_ERR_VALUE(ret));
-	NEVER(populate);
+	if (_PT_TRACE_USE_MIRROR_PAGES) {
+		ret = do_mmap_pgoff(NULL, POLICY_MATRIX, POLICY_SIZE, PROT_READ
+				| PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
+				0, &populate);
+		UNHANDLED(IS_ERR_VALUE(ret));
+		NEVER(populate);
+	}
 
 	pt_attach(current);
 }
@@ -2458,7 +2460,8 @@ void pt_on_mmap(struct file *file, unsigned long addr, unsigned long len,
 		- (pgoff << PAGE_SHIFT): len;
 	actual_len = len > actual_len? actual_len: len;
 	pt_log_xpage(current, addr, actual_len, PAGE_ALIGN(len));
-	pt_mirror_page(addr, len);
+	if (_PT_TRACE_USE_MIRROR_PAGES)
+		pt_mirror_page(addr, len);
 }
 
 void pt_on_syscall(struct pt_regs *regs)
