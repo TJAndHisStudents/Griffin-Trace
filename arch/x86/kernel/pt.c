@@ -261,7 +261,7 @@ struct pt_ring_buffer {
 	struct pt_ring_item * curr;
 	struct pt_ring_item * head;
 	void (* add_ring_item)(void *, ssize_t);
-	void (* print_buffer)(unsigned int);
+	void (* print_buffer)(int);
 };
 
 static struct pt_ring_buffer * ring_buffer;
@@ -304,9 +304,8 @@ void add_ring_item(void * data, ssize_t data_length) {
 	ring_buffer->curr = ring_buffer->curr->next;
 }
 
-void print_buffer(unsigned int max_number_of_buffers) {
-	// Set the minimum print index
-	unsigned int minimum_print_index, current_print_index, first_index;
+void print_buffer(int max_number_of_buffers) {
+	unsigned int last_index;
 
 	// Impose limits on the max number of buffers - if we break them, just show all
 	if (max_number_of_buffers <= 0 || max_number_of_buffers > RING_BUFFER_COUNT) {
@@ -320,41 +319,30 @@ void print_buffer(unsigned int max_number_of_buffers) {
 
 	pt_print("Current buffer is #%d, size (%zd)\n", ring_buffer->curr->index, ring_buffer->curr->data_length);
 
-	// If we don't have a full ring buffer, start at the head
-	if (ring_buffer->curr->next == NULL || ring_buffer->curr->data_length <= 0) {
-		ring_buffer->curr = ring_buffer->head;
+	// Walk backwards until we find the max number we can use
+	last_index = ring_buffer->curr->index;
+	while (ring_buffer->curr->prev != NULL && --max_number_of_buffers >= 0) {
+		ring_buffer->curr = ring_buffer->curr->prev;
 	}
-
-	// Set the first index for a stopping criterion
-	first_index = ring_buffer->curr->index;
-
-	// Validate the starting criterion - that we have data to print
-	if (ring_buffer->curr->data_length <= 0) {
-		return;
-	}
-
-	// Set the minimum print index
-	minimum_print_index = RING_BUFFER_COUNT - max_number_of_buffers;
-	current_print_index = 0;
 
 	// Print all of the buffers
 	// Use do-while because we want to stop at the same index as the one we started with
 	do {
-		// Only print if we should
-		if (current_print_index >= minimum_print_index) {
-			pt_print("Printing buffer #%d to %d, size (%zd)\n", ring_buffer->curr->index, first_index, ring_buffer->curr->data_length);
+		if (ring_buffer->curr->data_length > 0) {
+			pt_print("Printing buffer #%d to %d, size (%zd)\n", ring_buffer->curr->index, last_index, ring_buffer->curr->data_length);
 			pt_log(ring_buffer->curr->data, ring_buffer->curr->data_length);
 		}
 
-		// Increment print index
-		current_print_index++;
-
-		// Move to the next ring item
-		ring_buffer->curr = ring_buffer->curr->next;
+		if (ring_buffer->curr->next != NULL) {
+			// Move to the next ring item
+			ring_buffer->curr = ring_buffer->curr->next;
+		} else {
+			break;
+		}
 	} while (
 		ring_buffer->curr != NULL && 
 		ring_buffer->curr->data_length > 0 &&
-		ring_buffer->curr->index != first_index
+		ring_buffer->curr->index != last_index
 	);
 }
 
@@ -403,14 +391,14 @@ destroy_ring_buffer_cache:
 }
 
 int reset_ring_buffer(void) {
-	// If the head have a previous ring buffer item, start there.
+	// If the head has a previous ring buffer item, start there.
 	if (ring_buffer->head->prev != NULL) {
 		ring_buffer->curr = ring_buffer->head->prev;
 	}
 	// Otherwise, we're going to start at the current rb item, since it's the last
 
 	// Iterate over all ring items and set the data lengths to 0
-	while (ring_buffer->curr->prev != NULL && ring_buffer->curr->prev->data_length > 0) {
+	while (ring_buffer->curr->prev != NULL && ring_buffer->curr->index != 0) {
 		// Set the data length to 0 (won't print out)
 		ring_buffer->curr->data_length = 0;
 
@@ -418,6 +406,9 @@ int reset_ring_buffer(void) {
 		ring_buffer->curr = ring_buffer->curr->prev;
 	}
 	// Now we should be back at the head
+
+	// Set the head's data length to 0
+	ring_buffer->curr->data_length = 0;
 
 	return 0;
 }
@@ -445,14 +436,14 @@ static bool _PT_TRACE_PROC_END     = false;
 static bool _PT_TRACE_USE_MIRROR_PAGES = false;
 
 // Number of buffers before and after. No larger than {ring buffer max}/2.
-static int _PT_TRACE_ADDR_WIDTH = 1;
+static int _PT_TRACE_ADDR_WIDTH = 2;
 static int _PT_TRACE_SYSCALL_WIDTH = 1;
 static int _PT_TRACE_FWD_EDGE_WIDTH = 1;
 static int _PT_TRACE_SHADOW_STACK_WIDTH = 1;
 static int _PT_TRACE_PROC_END_WIDTH = 1;
 
 // For dumping traces on address triggers
-static int pt_address_count       = 3;
+static int pt_address_count = 0;
 static u64 pt_addresses[10] = {0,0,0,0,0,0,0,0,0,0};
 static char pt_addresses_string[PATH_MAX];
 
@@ -504,7 +495,7 @@ pt_trace_address_write(struct file *filp, const char __user *buf,
 {
 	int max_addresses = 10, address_size = 16; // 10 address triggers, 64-bit address space
 	char addresses[address_size * max_addresses];
-	char address[address_size];
+	char address[address_size + 1]; // requires a null terminator
 	int res = 0;
 	int iter = 0;
 
@@ -522,16 +513,18 @@ pt_trace_address_write(struct file *filp, const char __user *buf,
 	// Iterate over all items in the list
 	while(iter < max_addresses && iter * address_size < count) {
 		memcpy(address, addresses + iter * address_size, address_size);
+		address[address_size] = '\0';
 		res = kstrtoull(address, 16, &pt_addresses[iter]);
-		pt_print("%llu %d %d\n", pt_addresses[iter], address_size, res);
+		pt_print("%llx %d %d\n", pt_addresses[iter], address_size, res);
 		iter++;
 	}
 
 	// Validate and set
 	if (iter <= 0) {
+		pt_print("not tracing addresses\n");
 		_PT_TRACE_ADDR = false;
 	} else {
-		pt_address_count = iter / address_size;
+		pt_address_count = iter;
 		pt_print("tracing addresses, %d addresses, width of %d\n", pt_address_count, _PT_TRACE_ADDR_WIDTH);
 		_PT_TRACE_ADDR = true;
 		_PT_TRACE_USE_MIRROR_PAGES = true;
@@ -707,6 +700,8 @@ pt_trace_shadow_stack_write(struct file *filp, const char __user *buf,
 	} else {
 		pt_print("tracing shadow stack CFI violations, width of %d\n", _PT_TRACE_SHADOW_STACK_WIDTH);
 		_PT_TRACE_SHADOW_STACK = true;
+		_PT_TRACE_USE_MIRROR_PAGES = true;
+		pt_print("WARNING: Shadow Stack CFI tracing uses mirror pages. See documentation.\n");
 	}
 
 	return 1;
@@ -1063,6 +1058,9 @@ pt_monitor_write(struct file *filp, const char __user *buf,
 	pt_trace_shadow_stack_trigger = false;
 	pt_trace_syscall_trigger = false;
 	pt_trace_syscall_trigger_rb_index = -1;
+
+	// Reset the ring buffer
+	reset_ring_buffer();
 
 	pt_print("offline: %s registered\n", pt_monitor);
 
@@ -2054,11 +2052,12 @@ static void pt_work(struct work_struct *work)
 	{
 		// Write the existing ring buffers
 		pt_print("  Dumping trace from syscall trigger. Called on %d, dumped on %d, width is %d.", pt_trace_syscall_trigger_rb_index, ring_buffer->curr->index, _PT_TRACE_SYSCALL_WIDTH);
-		ring_buffer->print_buffer(_PT_TRACE_SYSCALL_WIDTH * 2);
 
-		// Unset the triggers
+		// Unset the triggers prior to printing - potential race condition with other triggers
 		pt_trace_syscall_trigger = false;
 		pt_trace_syscall_trigger_rb_index = -1;
+
+		ring_buffer->print_buffer(_PT_TRACE_SYSCALL_WIDTH * 2);
 	}
 
 	// Write any existing ring items - forward edge
@@ -2066,10 +2065,11 @@ static void pt_work(struct work_struct *work)
 	{
 		// Write the existing ring buffers
 		pt_print("  Dumping trace from CFI forward edge trigger.");
-		ring_buffer->print_buffer(_PT_TRACE_FWD_EDGE_WIDTH);
 
 		// Unset the trigger
 		pt_trace_fwd_edge_trigger = false;
+
+		ring_buffer->print_buffer(_PT_TRACE_FWD_EDGE_WIDTH);
 	}
 
 	// Write any existing ring items - shadow stack
@@ -2077,10 +2077,11 @@ static void pt_work(struct work_struct *work)
 	{
 		// Write the existing ring buffers
 		pt_print("  Dumping trace from CFI shadow stack trigger.");
-		ring_buffer->print_buffer(_PT_TRACE_SHADOW_STACK_WIDTH);
 
 		// Unset the trigger
 		pt_trace_shadow_stack_trigger = false;
+
+		ring_buffer->print_buffer(_PT_TRACE_SHADOW_STACK_WIDTH);
 	}
 
 	// Write any existing ring items - address trigger
@@ -2088,10 +2089,11 @@ static void pt_work(struct work_struct *work)
 	{
 		// Write the existing ring buffers
 		pt_print("  Dumping trace from CFI address trigger.");
-		ring_buffer->print_buffer(_PT_TRACE_ADDR_WIDTH);
 
 		// Unset the trigger
 		pt_trace_addr_trigger = false;
+
+		ring_buffer->print_buffer(_PT_TRACE_ADDR_WIDTH);
 	}
 }
 
@@ -2376,7 +2378,8 @@ void pt_on_exit(void)
 	}
 
 	// Now clear all of the buffers
-	reset_ring_buffer();
+	//reset_ring_buffer();
+	// there may be a race condition here with printing on other terms (not just proc end).
 }
 
 int pt_on_interrupt(struct pt_regs *regs)
