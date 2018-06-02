@@ -17,6 +17,7 @@
 //#define DEBUG
 
 #define UNHANDLED(condition) BUG_ON(condition)
+#define pt_alert(fmt, ...) printk(KERN_EMERG "pt: " fmt, ## __VA_ARGS__)
 #define pt_print(fmt, ...) printk(KERN_INFO "pt: " fmt, ## __VA_ARGS__)
 
 #ifdef DEBUG
@@ -528,7 +529,7 @@ pt_trace_address_write(struct file *filp, const char __user *buf,
 		pt_print("tracing addresses, %d addresses, width of %d\n", pt_address_count, _PT_TRACE_ADDR_WIDTH);
 		_PT_TRACE_ADDR = true;
 		_PT_TRACE_USE_MIRROR_PAGES = true;
-		pt_print("WARNING: Address tracing uses mirror pages. See documentation.\n");
+		pt_alert("WARNING: Address tracing uses mirror pages, which allocates user-space memory as readable and writable. See documentation.\n");
 	}
 
 	return count;
@@ -643,7 +644,7 @@ pt_trace_fwd_edge_write(struct file *filp, const char __user *buf,
 		pt_print("tracing fwd edge CFI violations, width of %d\n", _PT_TRACE_FWD_EDGE_WIDTH);
 		_PT_TRACE_FWD_EDGE = true;
 		_PT_TRACE_USE_MIRROR_PAGES = true;
-		pt_print("WARNING: Forward Edge CFI tracing uses mirror pages. See documentation.\n");
+		pt_alert("WARNING: Tracing Forward Edge violations uses mirror pages, which allocates user-space memory as readable and writable. See documentation.\n");
 	}
 
 	return 1;
@@ -701,7 +702,7 @@ pt_trace_shadow_stack_write(struct file *filp, const char __user *buf,
 		pt_print("tracing shadow stack CFI violations, width of %d\n", _PT_TRACE_SHADOW_STACK_WIDTH);
 		_PT_TRACE_SHADOW_STACK = true;
 		_PT_TRACE_USE_MIRROR_PAGES = true;
-		pt_print("WARNING: Shadow Stack CFI tracing uses mirror pages. See documentation.\n");
+		pt_alert("WARNING: Tracing Shadow Stack violations uses mirror pages, which allocates user-space memory as readable and writable. See documentation.\n");
 	}
 
 	return 1;
