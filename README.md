@@ -1,7 +1,11 @@
 GRIFFIN TRACE
 =============
 
-Griffin Trace is an application of the Griffin Control-Flow Integrity (CFI) monitor. Griffin Trace watches a program during runtime and records traces during specific triggers. Right now, Griffin Trace can report the traces at Forward Edge and Shadow Stack violations, at the conclusion of a program run (either naturally or by an exception), and at system calls.
+Griffin Trace is an application of the Griffin Control-Flow Integrity (CFI) monitor. Griffin Trace watches a program during runtime and records traces during specific triggers. Right now, Griffin Trace can report the traces at Forward Edge and Shadow Stack violations, at the conclusion of a program run (either naturally or by an exception), at system calls, and at specific addresses.
+
+## WARNING
+
+Griffin Trace uses a technique to reconstruct the control flow of a program in realtime in order to watch for forward-edge and  shadow stack violations, and to identify specific address triggers. These require the use of mirror pages, which currently allocate user-space memory as both readable and writable. **We do not recommend using this feature on deployment hardware at this time, and restrict usage only to development and testing environments.**
 
 ## Requirements
 
