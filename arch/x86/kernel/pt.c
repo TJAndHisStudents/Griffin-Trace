@@ -2094,7 +2094,7 @@ static void pt_work(struct work_struct *work)
 		// Unset the trigger
 		pt_trace_addr_trigger = false;
 
-		ring_buffer->print_buffer(_PT_TRACE_ADDR_WIDTH);
+		//ring_buffer->print_buffer(_PT_TRACE_ADDR_WIDTH);
 	}
 }
 
