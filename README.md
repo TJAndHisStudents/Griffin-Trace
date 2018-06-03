@@ -5,7 +5,9 @@ Griffin Trace is an application of the Griffin Control-Flow Integrity (CFI) moni
 
 ## WARNING
 
-Griffin Trace uses a technique to reconstruct the control flow of a program in realtime in order to watch for forward-edge and  shadow stack violations, and to identify specific address triggers. These require the use of mirror pages, which currently allocate user-space memory as both readable and writable. **We do not recommend using this feature on deployment hardware at this time, and restrict usage only to development and testing environments.**
+Griffin Trace uses a technique to reconstruct the control flow of a program in realtime in order to watch for forward-edge and  shadow stack violations, and to identify specific address triggers. These require the use of mirror pages in user space memory, which currently requires disabling of SMAP protections that limit kernel access to user-space memory. **No one should use this feature on deployment systems at this time, but rather restrict usage only to software testing environments.**
+
+
 
 ## Requirements
 
