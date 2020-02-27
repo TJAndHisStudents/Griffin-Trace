@@ -2470,7 +2470,7 @@ void pt_on_mmap(struct file *file, unsigned long addr, unsigned long len,
 
 void pt_on_syscall(struct pt_regs *regs)
 {
-	if (!pt_enabled())
+	if (!pt_avail() || !pt_enabled())
 		return;
 
 	switch (regs->orig_ax) {
