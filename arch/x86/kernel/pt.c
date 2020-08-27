@@ -1146,6 +1146,7 @@ static inline void pt_process_buffer(struct pt_buffer *buf)
 	struct topa *topa = buf->topa;
 
 	/* global shadow stack check! */
+	/*
 	for (i = 0; i < buf->index; i++) {
 		event = buf->stack[i];
 		if (PT_EVENT_IS_CALL(event)) {
@@ -1159,6 +1160,7 @@ static inline void pt_process_buffer(struct pt_buffer *buf)
 			}
 		}
 	}
+	*/
 
 	if (buf->child_topa) {
 		NEVER(buf->child_topa->index);
