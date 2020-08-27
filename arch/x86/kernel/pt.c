@@ -1473,6 +1473,9 @@ static void pt_tasklet(unsigned long data)
 static int pt_move_trace_to_work(struct topa *topa, u32 size,
 		struct topa *child_topa, bool waiting)
 {
+	kmem_cache_free(pt_trace_cache, topa->raw);
+	return 0;
+
 	struct pt_buffer *buf;
 	DECLARE_COMPLETION(notifier);
 
