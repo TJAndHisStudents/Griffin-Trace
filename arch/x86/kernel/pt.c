@@ -1300,6 +1300,7 @@ do { \
 		NEVER(kind == PT_PACKET_ERROR);
 		NEVER(packet_len == 0 || packet_len > bytes_remained);
 
+#if 0
 		switch (kind) {
 		case PT_PACKET_TNTSHORT:
 			mask = (u8)*packet;
@@ -1424,6 +1425,7 @@ do { \
 		default:
 			break;
 		}
+#endif
 
 		bytes_remained -= packet_len;
 		packet += packet_len;
